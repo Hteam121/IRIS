@@ -13,8 +13,24 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "13.0"
     # Local-dev signing; the app spawns subprocesses and captures the screen,
     # so the sandbox is disabled via IRIS.entitlements (see plan.md fix #3).
-    CODE_SIGN_STYLE: Automatic
-    CODE_SIGN_IDENTITY: "-"
+    #
+    # IMPORTANT: sign with a STABLE Apple Development identity (not ad-hoc "-").
+    # Ad-hoc signing makes the codesign "designated requirement" a per-build cdhash,
+    # so every rebuild looks like a new app to macOS TCC and re-prompts for Mic /
+    # Screen Recording every launch. A real signing identity keys TCC to the cert +
+    # bundle id, so granted permissions persist across rebuilds.
+    # Manual signing with a Development cert already in the keychain — macOS apps can
+    # be signed and run locally without a provisioning profile, and this keeps the
+    # codesign identity stable across rebuilds so TCC permissions persist (ad-hoc "-"
+    # signing changes the cdhash every build, which makes macOS re-prompt for Mic /
+    # Screen Recording on every launch). Sign by the cert SHA-1 so the name/team can't
+    # drift, and disable the development-profile requirement (not needed for a local app).
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "D9280BD59FC5E00B14EA754F9759C308C361E5C2"
+    DEVELOPMENT_TEAM: "2ZY9CXJ2SP"
+    PROVISIONING_PROFILE_SPECIFIER: ""
+    CODE_SIGNING_REQUIRES_DEVELOPMENT_PROFILE: NO
+    CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
     ENABLE_HARDENED_RUNTIME: NO
 
 targets:
