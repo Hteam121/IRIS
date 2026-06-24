@@ -15,45 +15,57 @@ import Foundation
 
 public final class IRISBrain: IRISResponder {
     private let settings: Settings
-    private let agentMode: AgentMode
     private let urlSession: URLSession
 
     /// Spoken-output framing (docs/algorithms.md → AI routing → System framing).
     static let systemPrompt = """
-    You are IRIS, a helpful voice assistant running on the user's Mac. Your reply will be \
-    spoken aloud, so be concise: at most 3 sentences unless the user explicitly asks for more. \
-    Do not use markdown, bullet lists, code fences, or emoji — plain spoken sentences only. \
-    If a screenshot of the user's screen is provided, use it to answer questions about what \
-    they're looking at.
+    You are IRIS, a voice assistant on the user's Mac. You're in a spoken, back-and-forth \
+    conversation, so talk like a real person — warm, natural, casual — not like a document or a \
+    formal assistant. Keep every reply to ONE or TWO short sentences. Summarize: give the gist a \
+    person would say out loud; never read lists, bullet points, or step-by-step items aloud, and \
+    don't itemize — distill it. No markdown, bullets, numbered lists, code, emoji, or spoken-out \
+    URLs. If the user asks for more detail, you can go a little longer, but stay conversational. \
+    If a screenshot is provided, use it to answer about what's on their screen.
     """
 
     static let maxTokens = 512
 
+    /// A one-line "you know the current time" context so the model never claims it can't access
+    /// the clock and can answer time-relative questions. Computed per request (current time).
+    static func nowContext() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a zzz"
+        return "For reference, the current local date and time is \(f.string(from: Date()))."
+    }
+
     public init(settings: Settings) {
         self.settings = settings
-        self.agentMode = AgentMode(settings: settings)
         self.urlSession = .shared
     }
 
     // MARK: - IRISResponder
 
+    /// Answer a foreground question. Routing happens upstream in AppDelegate; by the time we're
+    /// here the command is a plain question to answer (optionally using the screenshot).
     public func ask(transcript: String, screenshotPath: String?) async -> String {
-        let lower = transcript.lowercased()
+        await ask(transcript: transcript, screenshotPath: screenshotPath, history: [])
+    }
 
-        // Agentic intent takes precedence over Q&A.
-        if lower.contains("iris agent") {
-            return await agentMode.run(transcript: transcript)
-        }
-
+    /// History-aware answer. `history` is recent (role, content) turns so IRIS holds a
+    /// conversation (e.g. answering a follow-up after it asked a question). role ∈ user/assistant.
+    public func ask(transcript: String, screenshotPath: String?,
+                    history: [[String: String]]) async -> String {
         if let key = settings.anthropicAPIKey, !key.isEmpty {
-            return await askAPI(transcript: transcript, screenshotPath: screenshotPath, apiKey: key)
+            return await askAPI(transcript: transcript, screenshotPath: screenshotPath,
+                                apiKey: key, history: history)
         }
-        return await askCLI(transcript: transcript, screenshotPath: screenshotPath)
+        return await askCLI(transcript: transcript, screenshotPath: screenshotPath, history: history)
     }
 
     // MARK: - Anthropic Messages API (true vision)
 
-    private func askAPI(transcript: String, screenshotPath: String?, apiKey: String) async -> String {
+    private func askAPI(transcript: String, screenshotPath: String?, apiKey: String,
+                        history: [[String: String]]) async -> String {
         guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
             return Self.genericError
         }
@@ -73,11 +85,17 @@ public final class IRISBrain: IRISResponder {
         }
         content.append(["type": "text", "text": transcript])
 
+        // Prior turns (text-only) for conversational continuity, then the current message.
+        var messages: [[String: Any]] = history.map {
+            ["role": $0["role"] ?? "user", "content": $0["content"] ?? ""]
+        }
+        messages.append(["role": "user", "content": content])
+
         let body: [String: Any] = [
             "model": settings.model,
             "max_tokens": Self.maxTokens,
-            "system": Self.systemPrompt,
-            "messages": [["role": "user", "content": content]],
+            "system": Self.systemPrompt + "\n\n" + Self.nowContext(),
+            "messages": messages,
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
             return Self.genericError
@@ -112,13 +130,22 @@ public final class IRISBrain: IRISResponder {
 
     // MARK: - claude CLI (subscription, best-effort vision via file path)
 
-    private func askCLI(transcript: String, screenshotPath: String?) async -> String {
+    private func askCLI(transcript: String, screenshotPath: String?,
+                        history: [[String: String]]) async -> String {
         let binary = settings.claudeBinary
         guard !binary.isEmpty, FileManager.default.isExecutableFile(atPath: binary) else {
             return "I can't reach Claude right now — the claude command wasn't found and no API key is set."
         }
 
-        var prompt = Self.systemPrompt + "\n\n"
+        var prompt = Self.systemPrompt + "\n\n" + Self.nowContext() + "\n\n"
+        if !history.isEmpty {
+            prompt += "Conversation so far:\n"
+            for turn in history {
+                let who = (turn["role"] == "assistant") ? "IRIS" : "User"
+                prompt += "\(who): \(turn["content"] ?? "")\n"
+            }
+            prompt += "\n"
+        }
         if let path = screenshotPath {
             prompt += """
             A screenshot of the user's current screen has been saved to this PNG file. \
@@ -157,6 +184,26 @@ public final class IRISBrain: IRISResponder {
 /// (plan.md fix #2 — keeps large content out of `ARG_MAX`). Used by both `IRISBrain`'s
 /// CLI path and `AgentMode`. stderr is discarded; only stdout (the reply) is returned.
 enum ClaudeProcessRunner {
+    /// Thread-safe holder for the running `Process` so a Task cancellation (barge-in) can
+    /// terminate it. The continuation resumes normally once the terminated process's stdout
+    /// hits EOF, so cancellation never leaks a continuation.
+    private final class ProcessBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var process: Process?
+        private var terminated = false
+
+        func set(_ p: Process) {
+            lock.lock(); defer { lock.unlock() }
+            // If cancellation already arrived, terminate immediately.
+            if terminated { p.terminate() } else { process = p }
+        }
+        func terminate() {
+            lock.lock(); defer { lock.unlock() }
+            terminated = true
+            if let p = process, p.isRunning { p.terminate() }
+        }
+    }
+
     static func run(binary: String, args: [String], prompt: String) async -> (ok: Bool, output: String) {
         let promptURL = URL(fileURLWithPath: NSTemporaryDirectory() + "iris-prompt-\(UUID().uuidString).txt")
         guard (try? prompt.write(to: promptURL, atomically: true, encoding: .utf8)) != nil else {
@@ -164,40 +211,47 @@ enum ClaudeProcessRunner {
         }
         defer { try? FileManager.default.removeItem(at: promptURL) }
 
-        return await withCheckedContinuation { (continuation: CheckedContinuation<(ok: Bool, output: String), Never>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                guard let inHandle = try? FileHandle(forReadingFrom: promptURL) else {
-                    continuation.resume(returning: (false, ""))
-                    return
-                }
+        let box = ProcessBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<(ok: Bool, output: String), Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    guard let inHandle = try? FileHandle(forReadingFrom: promptURL) else {
+                        continuation.resume(returning: (false, ""))
+                        return
+                    }
 
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: binary)
-                process.arguments = args
-                process.standardInput = inHandle
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: binary)
+                    process.arguments = args
+                    process.standardInput = inHandle
 
-                let outPipe = Pipe()
-                process.standardOutput = outPipe
-                // Discard stderr to avoid a full-buffer deadlock while we drain stdout.
-                process.standardError = FileHandle.nullDevice
+                    let outPipe = Pipe()
+                    process.standardOutput = outPipe
+                    // Discard stderr to avoid a full-buffer deadlock while we drain stdout.
+                    process.standardError = FileHandle.nullDevice
 
-                do {
-                    try process.run()
-                } catch {
+                    box.set(process)   // expose for cancellation (terminate-on-barge-in)
+
+                    do {
+                        try process.run()
+                    } catch {
+                        try? inHandle.close()
+                        continuation.resume(returning: (false, ""))
+                        return
+                    }
+
+                    // Read stdout to EOF (process closes it on exit or termination), then reap.
+                    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
                     try? inHandle.close()
-                    continuation.resume(returning: (false, ""))
-                    return
+
+                    let out = String(data: outData, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    continuation.resume(returning: (process.terminationStatus == 0, out))
                 }
-
-                // Read stdout to EOF (process closes it on exit), then reap.
-                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                try? inHandle.close()
-
-                let out = String(data: outData, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                continuation.resume(returning: (process.terminationStatus == 0, out))
             }
+        } onCancel: {
+            box.terminate()
         }
     }
 }

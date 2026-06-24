@@ -11,13 +11,16 @@
 
 import AppKit
 import SwiftUI
+import Combine
+import CoreGraphics
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    // Shared contract + config (Phase 0).
+    // Shared contract + config (Phase 0). `settings` is mutable so the menu-bar Settings
+    // window can update API keys / model and have them apply live (see applySettings).
     private let appState = AppState()
-    private let settings = Settings.load()
+    private var settings = IRISSettings.load()
 
     // Components (Phase 1 lanes), retained for the app's lifetime.
     private var panel: FloatingPanel?
@@ -25,7 +28,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var wakeWord: WakeWordDetector?
     private var speaker: Speaker?
     private let screenCapture = ScreenCapture()
-    private var brain: IRISResponder?
+    // Concrete type (not the IRISResponder protocol) so we can rebuild it on key changes
+    // without touching the frozen Core.swift contract.
+    private var brain: IRISBrain?
+    // Manages background agent tasks (LangGraph sidecar). Independent of the foreground
+    // pipeline below — launching/cancelling background work never touches `currentTask`.
+    private var agentManager: AgentManager!
+    // Realtime (Jarvis/Cluely) conversational core; replaces the wake-word pipeline when enabled.
+    // In realtime mode the wake detector GATES the costly stream: IRIS sleeps (wake-word listening)
+    // until "hey iris", runs the realtime conversation, then sleeps again after idle.
+    private var realtimeSession: RealtimeSession?
+    private var realtimeActive = false
+    private let settingsWindowController = SettingsWindowController()
+
+    // In-flight FOREGROUND command tasks, keyed by id. Consecutive questions run CONCURRENTLY
+    // (a new command never cancels a previous one); their spoken answers are serialized by the
+    // Speaker's queue. Voice barge-in (wake phrase while speaking) and the ⌥⎋ hotkey / menu are
+    // how speech is actually stopped. Background agents live in `agentManager`, not here.
+    private var foregroundTasks: [UUID: Task<Void, Never>] = [:]
+
+    // Global hotkey monitors (⌥⎋) for interrupting from any app. Two monitors are needed:
+    // a global one for when another app is focused, and a local one for when IRIS is focused
+    // (e.g. the Settings window) — global monitors don't observe events routed to our own app.
+    private var globalHotkeyMonitor: Any?
+    private var localHotkeyMonitor: Any?
+
+    // Observers (e.g. keeping the menu-bar Active-agents list in sync with backgroundTasks).
+    private var cancellables = Set<AnyCancellable>()
+
+    // Loop guards: ignore an identical command repeated within a short window, and don't open
+    // multiple terminals back-to-back — defends against any residual self-hearing echo.
+    private var lastCommandText = ""
+    private var lastCommandAt = Date.distantPast
+    private var lastTerminalLaunchAt = Date.distantPast
+
+    // Conversation memory + follow-up: recent (role, content) turns so IRIS holds context, and a
+    // flag so that when IRIS asks a question it auto-listens for the answer (no wake word needed).
+    private var conversation: [[String: String]] = []
+    private var lastTurnAt = Date.distantPast
+    private var expectingFollowUp = false
 
     // MARK: - Lifecycle
 
@@ -33,7 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Menu-bar accessory: no dock icon, doesn't take over the active app.
         NSApp.setActivationPolicy(.accessory)
 
-        // The brain (hybrid CLI/API routing) implements the IRISResponder contract.
+        // The brain (hybrid CLI/API routing + intent routing).
         brain = IRISBrain(settings: settings)
 
         // Floating orb overlay, shown near the cursor and tracking it.
@@ -42,43 +83,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.show()
 
         // Text-to-speech. When speech finishes, return to idle and resume listening.
-        let speaker = Speaker(settings: settings, appState: appState)
-        speaker.onFinished = { [weak self] in self?.appState.status = .idle }
+        let speaker = makeSpeaker()
         self.speaker = speaker
 
-        // Menu-bar 👁: toggle the overlay / quit.
+        // Background agent manager (LangGraph sidecar): spawns/supervises the sidecar and
+        // streams task state into AppState. Independent of the foreground pipeline.
+        let agentManager = AgentManager(settings: settings, appState: appState, speaker: speaker)
+        self.agentManager = agentManager
+        // Speak background-task results with the MAIN realtime voice when a conversation is live
+        // (so they never overlap it); otherwise use the TTS speaker (no main voice to clash with).
+        agentManager.onAnnouncement = { [weak self] text in
+            guard let self else { return }
+            if self.realtimeActive, let rt = self.realtimeSession, rt.isActive {
+                rt.announce(text)
+            } else {
+                self.speaker?.enqueue(text)
+            }
+        }
+        agentManager.start()
+
+        // Menu-bar 👁: toggle the overlay / open Settings / quit.
         let statusBarItem = StatusBarItem()
         statusBarItem.onToggle = { [weak panel] in panel?.toggle() }
+        statusBarItem.onSettings = { [weak self] in self?.showSettings() }
+        statusBarItem.onInterrupt = { [weak self] in self?.handleInterruptRequest() }
+        statusBarItem.onCancelAgent = { [weak self] id in self?.agentManager.cancel(id) }
         statusBarItem.onQuit = { NSApp.terminate(nil) }
         self.statusBarItem = statusBarItem
 
-        // Wake-word listener → command handler.
-        let wake = WakeWordDetector(settings: settings, appState: appState)
-        wake.onWakeWordDetected = { [weak self] command in
-            self?.handleCommand(command)
-        }
-        self.wakeWord = wake
+        // Keep the menu-bar "Active agents" section in sync with the live task set.
+        appState.$backgroundTasks
+            .receive(on: DispatchQueue.main)
+            .sink { [weak statusBarItem] tasks in statusBarItem?.refresh(tasks: tasks) }
+            .store(in: &cancellables)
 
-        // Request Mic + Speech access, then start listening. (Screen Recording is granted
-        // lazily on the first capture; it can't be requested programmatically.)
-        WakeWordDetector.requestAuthorization { [weak self] granted in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                NSLog("[IRIS] mic + speech authorization granted: \(granted)")
-                if granted {
-                    self.wakeWord?.start()
-                } else {
-                    self.appState.responseText =
-                        "I need Microphone and Speech Recognition access to listen. Enable them in System Settings → Privacy & Security."
+        // Global hotkey (⌥⎋ Option+Escape): interrupt IRIS from anywhere, even while it's
+        // speaking — the voice mic is muted during TTS, so this is the reliable barge-in.
+        installInterruptHotkey()
+
+        // Proactively request permissions up front: Microphone + Speech (prompted below), Screen
+        // Recording, and — for Mac control — Accessibility. (Automation/Apple Events for Terminal
+        // still prompts on first actual use; macOS only allows that on a real Apple Event.)
+        requestScreenRecordingPermission()
+        if settings.computerUseEnabled {
+            _ = ComputerControl.ensureAccessibility(prompt: true)
+        }
+
+        if settings.realtimeEnabled {
+            // Jarvis/Cluely core, wake-gated: a local "hey iris" listener starts the realtime
+            // conversation; it auto-sleeps after `idlePauseSeconds` of no speech (saves cost).
+            let rt = RealtimeSession(settings: settings, appState: appState,
+                                     agentManager: agentManager, screenCapture: screenCapture)
+            rt.onIdleTimeout = { [weak self] in self?.goToSleep() }
+            self.realtimeSession = rt
+
+            let wake = WakeWordDetector(settings: settings, appState: appState)
+            wake.onWakeDetected = { [weak self] in self?.wakeUp() }
+            self.wakeWord = wake
+
+            WakeWordDetector.requestAuthorization { [weak self] granted in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    NSLog("[IRIS] mic authorization granted: \(granted)")
+                    if granted {
+                        wake.start()   // start asleep — listening only for the wake phrase
+                    } else {
+                        self.appState.responseText =
+                            "I need Microphone access to talk. Enable it in System Settings → Privacy & Security."
+                    }
+                }
+            }
+        } else {
+            // Classic wake-word pipeline (fallback).
+            let wake = makeWakeWord()
+            self.wakeWord = wake
+            WakeWordDetector.requestAuthorization { [weak self] granted in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    NSLog("[IRIS] mic + speech authorization granted: \(granted)")
+                    if granted {
+                        wake.start()
+                    } else {
+                        self.appState.responseText =
+                            "I need Microphone and Speech Recognition access to listen. Enable them in System Settings → Privacy & Security."
+                    }
                 }
             }
         }
     }
 
+    /// "Hey IRIS" heard while sleeping → start the realtime conversation (stop the wake listener).
+    private func wakeUp() {
+        guard settings.realtimeEnabled, let rt = realtimeSession, !realtimeActive else { return }
+        realtimeActive = true
+        IRISLog.log("wake phrase → starting realtime conversation")
+        wakeWord?.stop()
+        appState.status = .listening
+        rt.start()
+    }
+
+    /// No speech for `idlePauseSeconds` → pause the realtime stream and return to wake listening.
+    private func goToSleep() {
+        guard realtimeActive else { return }
+        realtimeActive = false
+        IRISLog.log("idle → pausing realtime, back to wake-word listening")
+        realtimeSession?.stop()
+        appState.status = .idle
+        appState.transcript = ""
+        appState.responseText = ""
+        wakeWord?.start()
+    }
+
+    /// Surface the Screen Recording prompt at launch (for screen vision). macOS can't fully grant
+    /// it programmatically — this adds IRIS to the list and prompts; the user may still need to
+    /// toggle it in System Settings → Privacy & Security → Screen Recording and relaunch.
+    private func requestScreenRecordingPermission() {
+        DispatchQueue.global(qos: .utility).async {
+            let granted = CGRequestScreenCaptureAccess()
+            NSLog("[IRIS] screen recording access granted: \(granted)")
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         wakeWord?.stop()
+        realtimeSession?.stop()
         speaker?.stop()
+        agentManager?.shutdown()
         panel?.hide()
+        if let m = globalHotkeyMonitor { NSEvent.removeMonitor(m) }
+        if let m = localHotkeyMonitor { NSEvent.removeMonitor(m) }
     }
 
     // Accessory app with no standard windows — never quit just because a window closed.
@@ -86,20 +219,330 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    // MARK: - Component factories
+
+    /// Build a Speaker from the current settings, wiring the finished→idle callback.
+    private func makeSpeaker() -> Speaker {
+        let speaker = Speaker(settings: settings, appState: appState)
+        speaker.onFinished = { [weak self] in self?.speechFinished() }
+        return speaker
+    }
+
+    /// Build a WakeWordDetector from the current settings, wiring the command handler.
+    private func makeWakeWord() -> WakeWordDetector {
+        let wake = WakeWordDetector(settings: settings, appState: appState)
+        wake.onWakeWordDetected = { [weak self] command in
+            self?.handleCommand(command)
+        }
+        wake.onBargeIn = { [weak self] in
+            self?.handleVoiceBargeIn()
+        }
+        return wake
+    }
+
+    /// The user spoke over IRIS: stop talking (and any queued announcements) and return to
+    /// listening. Background agents are deliberately left running.
+    private func handleVoiceBargeIn() {
+        guard appState.isSpeaking else { return }
+        speaker?.stop()
+    }
+
+    // MARK: - Settings window + live apply
+
+    private func showSettings() {
+        settingsWindowController.show(settings: settings) { [weak self] anthropic, openAI, model in
+            guard let self else { return }
+            let new = self.settings.withUpdatedKeys(
+                anthropic: anthropic, openAI: openAI, model: model)
+            do {
+                try new.save()
+            } catch {
+                NSLog("[IRIS] failed to save settings: \(error.localizedDescription)")
+            }
+            self.applySettings(new)
+        }
+    }
+
+    /// Apply updated settings live, rebuilding only the components whose inputs changed.
+    private func applySettings(_ new: IRISSettings) {
+        let keysChanged = new.anthropicAPIKey != settings.anthropicAPIKey
+            || new.openAIAPIKey != settings.openAIAPIKey
+            || new.model != settings.model
+        let voiceChanged = new.voice != settings.voice
+            || new.voiceIdentifier != settings.voiceIdentifier
+            || new.ttsRate != settings.ttsRate
+            || new.openAITTSEnabled != settings.openAITTSEnabled
+            || new.ttsVoice != settings.ttsVoice
+            || new.ttsModel != settings.ttsModel
+            || new.ttsInstructions != settings.ttsInstructions
+            || new.openAIAPIKey != settings.openAIAPIKey   // OpenAI TTS uses this key
+        let localeChanged = new.voice != settings.voice
+
+        settings = new
+
+        if keysChanged {
+            // The brain captures keys/model at init, so a fresh instance is the only way
+            // to pick up new credentials. Cheap, and has no audio impact.
+            brain = IRISBrain(settings: new)
+        }
+        if voiceChanged {
+            // Speaker caches the resolved voice lazily; rebuild to re-resolve it.
+            let newSpeaker = makeSpeaker()
+            speaker = newSpeaker
+            agentManager?.setSpeaker(newSpeaker)   // keep completion announcements wired
+        }
+        // Apply sidecar-affecting changes (keys/model/port/python) — may restart the sidecar.
+        agentManager?.applySettings(new)
+        realtimeSession?.applySettings(new)
+        if localeChanged {
+            // The detector's SFSpeechRecognizer is locale-bound; restart it. (wakePhrase is
+            // read live per-transcript, so a phrase-only change needs no restart.)
+            wakeWord?.stop()
+            let wake = makeWakeWord()
+            wakeWord = wake
+            wake.start()
+        }
+    }
+
+    // MARK: - Interrupt hotkey
+
+    /// ⌥⎋ (Option+Escape). 53 is the virtual keycode for Escape; we additionally require the
+    /// Option modifier so it doesn't collide with a bare Escape elsewhere.
+    private static let interruptKeyCode: UInt16 = 53
+
+    private func installInterruptHotkey() {
+        let matches: (NSEvent) -> Bool = { event in
+            event.keyCode == AppDelegate.interruptKeyCode
+                && event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .option
+        }
+        globalHotkeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard matches(event) else { return }
+            // Global monitors run off the main actor's static-isolation guarantee; hop on.
+            Task { @MainActor in self?.handleInterruptRequest() }
+        }
+        localHotkeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard matches(event) else { return event }
+            self?.handleInterruptRequest()
+            return nil   // swallow the event so it isn't beeped at as unhandled
+        }
+    }
+
+    /// User explicitly asked to stop (hotkey or menu). Cancel everything foreground and reset.
+    private func handleInterruptRequest() {
+        guard !foregroundTasks.isEmpty || appState.isSpeaking || appState.status != .idle else { return }
+        interrupt()
+        appState.status = .idle
+        appState.responseText = ""
+    }
+
     // MARK: - Command pipeline
 
-    /// capture → ask → speak, updating `AppState` at each step on the main actor.
+    /// Route the command, then either answer in the FOREGROUND (concurrently — consecutive
+    /// questions don't cancel each other; their answers are serialized by the Speaker queue) or
+    /// dispatch a BACKGROUND agent task. Updates `AppState` on the main actor.
     private func handleCommand(_ command: String) {
+        // A bare spoken "stop" (or "never mind", "be quiet", …) is a FULL interrupt: cancel all
+        // in-flight foreground work and silence IRIS, so a previously-started answer doesn't
+        // resume playing after you've told it to stop. (Wake-phrase barge-in already stopped the
+        // current utterance the moment "hey iris" was heard; this prevents it coming back.)
+        if Self.isStopCommand(command) {
+            interrupt()
+            appState.status = .idle
+            appState.responseText = ""
+            return
+        }
+
+        // Debounce exact-duplicate commands (defends against self-hearing / stutter loops where
+        // IRIS's own words get re-delivered as the same command repeatedly).
+        let normalized = command.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized == lastCommandText, Date().timeIntervalSince(lastCommandAt) < 3.0 {
+            NSLog("[IRIS] ignoring duplicate command within 3s: \"\(command)\"")
+            return
+        }
+        lastCommandText = normalized
+        lastCommandAt = Date()
+        expectingFollowUp = false   // recomputed per command (set only when IRIS asks something)
+
+        // Otherwise consecutive commands run CONCURRENTLY — a new question never cancels an
+        // in-flight one (both get answered). Background agents in `agentManager` are untouched.
         appState.status = .thinking
         appState.responseText = ""
 
-        Task { @MainActor in
-            let screenshotPath = await screenCapture.capture()
-            let reply = await brain?.ask(transcript: command, screenshotPath: screenshotPath)
-                ?? IRISBrain.genericError
-            appState.responseText = reply
-            // Speaker sets status → .speaking and returns it to .idle when done.
-            speaker?.speak(reply)
+        let id = UUID()
+        let task = Task { @MainActor in
+            defer {
+                foregroundTasks[id] = nil
+                // If nothing else is working or talking, settle the orb back to idle.
+                if foregroundTasks.isEmpty, !appState.isSpeaking, appState.status == .thinking {
+                    appState.status = .idle
+                }
+            }
+
+            // Spoken cancellation of a running agent ("cancel the deal search").
+            let lower = command.lowercased()
+            if lower.hasPrefix("cancel ") || lower.hasPrefix("stop the ")
+                || lower.contains("cancel the") {
+                if let title = agentManager.cancelMatching(command) {
+                    finishForeground("Okay, I cancelled \(title).")
+                    return
+                }
+            }
+
+            let router = IntentRouter(settings: settings, urlSession: .shared)
+            let intent = await router.route(command)
+            if Task.isCancelled { return }
+
+            switch intent {
+            case .answer:
+                // Answer time/date locally (correct + instant; no "I can't access the clock").
+                if let local = LocalAnswers.answer(for: command) {
+                    finishForeground(local)
+                    return
+                }
+                let history = historyForLLM()
+                var screenshotPath: String? = nil
+                if Self.isVisionQuestion(command) {
+                    // Acknowledge right away so there's no dead air while we capture + analyze.
+                    finishForeground("Let me take a look.")
+                    screenshotPath = await screenCapture.capture()
+                    if Task.isCancelled { return }
+                }
+                let reply = await brain?.ask(transcript: command, screenshotPath: screenshotPath,
+                                             history: history) ?? IRISBrain.genericError
+                if Task.isCancelled { return }
+                recordTurn(user: command, assistant: reply)
+                // If IRIS asked something, auto-listen for the reply (no wake word) afterward.
+                expectingFollowUp = Self.looksLikeQuestion(reply)
+                finishForeground(reply)
+
+            case .openApp(let name):
+                let reply = await AppLauncher.open(appName: name)
+                if Task.isCancelled { return }
+                finishForeground(reply)
+
+            case .openFolder(let dir):
+                let target = dir ?? FileManager.default.homeDirectoryForCurrentUser.path
+                let reply = FolderOpener.open(target)
+                if Task.isCancelled { return }
+                finishForeground(reply)
+
+            case .webSearch(let query, let browser):
+                let reply = WebSearch.open(query: query, browser: browser)
+                if Task.isCancelled { return }
+                finishForeground(reply)
+
+            case .terminal(let dir, let startClaude):
+                // Don't spawn multiple terminals in quick succession (loop guard).
+                if Date().timeIntervalSince(lastTerminalLaunchAt) < 5.0 {
+                    finishForeground("I just opened a terminal a moment ago.")
+                    return
+                }
+                lastTerminalLaunchAt = Date()
+                let target = dir ?? settings.defaultAgentDirectory
+                let reply = await TerminalLauncher.open(
+                    in: target, claudeBinary: settings.claudeBinary, startClaude: startClaude)
+                if Task.isCancelled { return }
+                // If the user named a folder we couldn't resolve, say so instead of pretending.
+                if dir == nil, let named = router.spokenDirectoryName(command) {
+                    finishForeground("I couldn't find a folder called \(named), so I used your home folder. " + reply)
+                } else {
+                    finishForeground(reply)
+                }
+
+            case .backgroundAgent(let task):
+                let webish = ["deal", "price", "buy", "shop", "cheapest", "online", "web", "search for"]
+                    .contains { task.lowercased().contains($0) }
+                dispatchBackground(
+                    kind: webish ? .web : .agent, detail: task, title: nil,
+                    cwd: settings.defaultAgentDirectory,
+                    ack: "On it — I'll work on that in the background.")
+
+            case .calendar(let detail):
+                dispatchBackground(
+                    kind: .calendar, detail: detail, title: "Calendar appointment", cwd: nil,
+                    ack: "On it — I'll set that up on your calendar.")
+            }
         }
+        foregroundTasks[id] = task
+    }
+
+    /// A bare "stop"-type command → full interrupt. Phrases WITH an object ("stop the deal
+    /// search") are NOT here — those route to agent cancellation.
+    private static func isStopCommand(_ command: String) -> Bool {
+        let t = command.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: " .!,?").union(.whitespacesAndNewlines))
+        let stops: Set<String> = [
+            "stop", "stop it", "stop talking", "be quiet", "quiet", "shut up", "hush",
+            "never mind", "nevermind", "enough", "that's enough", "thats enough",
+            "forget it", "cancel that", "cancel",
+        ]
+        return stops.contains(t)
+    }
+
+    /// Heuristic: does this question need a screenshot? Non-vision questions skip the capture
+    /// (faster); vision ones get an immediate "Let me take a look." ack first.
+    private static func isVisionQuestion(_ s: String) -> Bool {
+        let l = s.lowercased()
+        let keys = ["screen", "looking at", "do you see", "what's this", "what is this",
+                    "read this", "this page", "this window", "on my display", "what am i",
+                    "see here", "in front of me", "highlighted", "what do you see"]
+        return keys.contains { l.contains($0) }
+    }
+
+    /// Queue a foreground reply to be spoken (concurrent answers are serialized by the queue)
+    /// and show it in the overlay.
+    private func finishForeground(_ reply: String) {
+        appState.responseText = reply
+        speaker?.enqueue(reply)
+    }
+
+    /// Hand a task to the background agent manager and immediately acknowledge by voice so
+    /// the user can move on to the next request while it runs. Returns to listening at once.
+    private func dispatchBackground(
+        kind: AgentTaskKind, detail: String, title: String?, cwd: String?, ack: String
+    ) {
+        agentManager.launch(kind: kind, detail: detail, title: title, cwd: cwd)
+        appState.responseText = ack
+        speaker?.enqueue(ack)
+    }
+
+    /// Cancel ALL in-flight foreground commands and stop any speech. Cancelling the tasks
+    /// propagates Swift cancellation into IRISBrain — including terminating a running `claude`
+    /// subprocess (see ClaudeProcessRunner) and the Anthropic/OpenAI URLSession calls.
+    private func interrupt() {
+        for t in foregroundTasks.values { t.cancel() }
+        foregroundTasks.removeAll()
+        speaker?.stop()   // delegate fires handleSpeechEnded → speechFinished()
+    }
+
+    /// Called when IRIS has fully finished talking. If it just asked a question, auto-listen for
+    /// the answer (no wake word). Otherwise return to idle when nothing else is in flight.
+    private func speechFinished() {
+        guard foregroundTasks.isEmpty else { return }
+        if expectingFollowUp {
+            expectingFollowUp = false
+            appState.status = .listening
+            wakeWord?.captureFollowUp()
+        } else {
+            appState.status = .idle
+        }
+    }
+
+    private static func looksLikeQuestion(_ reply: String) -> Bool {
+        reply.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+    }
+
+    /// Recent conversation turns to give the model context; cleared when stale (>2 min) so an
+    /// unrelated later command doesn't carry old baggage.
+    private func historyForLLM() -> [[String: String]] {
+        if Date().timeIntervalSince(lastTurnAt) > 120 { conversation.removeAll() }
+        return Array(conversation.suffix(8))
+    }
+
+    private func recordTurn(user: String, assistant: String) {
+        conversation.append(["role": "user", "content": user])
+        conversation.append(["role": "assistant", "content": assistant])
+        if conversation.count > 16 { conversation.removeFirst(conversation.count - 16) }
+        lastTurnAt = Date()
     }
 }

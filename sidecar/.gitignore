@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+mcp_servers.json
+*.egg-info/

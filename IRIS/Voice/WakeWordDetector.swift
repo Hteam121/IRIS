@@ -56,8 +56,27 @@ final class WakeWordDetector {
         muteLock.lock(); muted = value; muteLock.unlock()
     }
 
+    // Voice barge-in: with barge-in enabled (default), the audio tap stays LIVE while IRIS
+    // speaks (instead of muting) so the user can interrupt — but ONLY the wake phrase triggers
+    // it. IRIS never says "hey iris", so its own TTS (or background noise) can't self-trigger a
+    // barge-in. When disabled, the tap is muted during speech (no voice barge-in; ⌥⎋ only).
+    private let bargeInEnabled: Bool
+
+    // After IRIS stops speaking, briefly ignore wake matches so the acoustic tail of its own
+    // voice (or echo settling) can't trigger a spurious command.
+    private var speechCooldownUntil = Date.distantPast
+    private let speechCooldown: TimeInterval = 0.6
+
     /// Fires (on the main actor) with the user's command, wake phrase already stripped.
     var onWakeWordDetected: ((String) -> Void)?
+
+    /// Fires (on the main actor) when the wake phrase is heard while IRIS is speaking, so
+    /// AppDelegate can stop the speech immediately.
+    var onBargeIn: (() -> Void)?
+
+    /// Fires (on the main actor) the moment the wake phrase is detected — used to "wake" the
+    /// realtime session from its sleeping (wake-gated) state.
+    var onWakeDetected: (() -> Void)?
 
     private var isRunning = false
     private var capturing = false          // in the fresh-utterance command capture
@@ -71,21 +90,29 @@ final class WakeWordDetector {
     // Tuned constants — see docs/algorithms.md → wake word / command capture.
     private let bufferSize: AVAudioFrameCount = 1024
     private let restartInterval: TimeInterval = 50.0   // restart before the ~60s recognizer cap
-    private let rearmDebounce: TimeInterval = 0.5      // wait before re-arming after a detection
     private let settleTimeout: TimeInterval = 1.2      // end-of-utterance pause after the wake word
 
     init(settings: Settings, appState: AppState) {
         self.settings = settings
         self.appState = appState
+        self.bargeInEnabled = settings.bargeInEnabled
         let locale = Locale(identifier: settings.voice)
         self.recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer()
         self.transcriber = Transcriber(settings: settings)
 
-        // Mirror TTS state into the mute flag the realtime tap consults.
+        // Mirror TTS state into the mute flag the realtime tap consults, and start a short
+        // cooldown when speech ends so IRIS's own audio tail can't trigger a wake.
         appState.$isSpeaking
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] speaking in self?.setMuted(speaking) }
+            .sink { [weak self] speaking in self?.handleSpeakingChanged(speaking) }
             .store(in: &cancellables)
+    }
+
+    private func handleSpeakingChanged(_ speaking: Bool) {
+        setMuted(speaking)
+        if !speaking {
+            speechCooldownUntil = Date().addingTimeInterval(speechCooldown)
+        }
     }
 
     // MARK: - Authorization
@@ -114,6 +141,15 @@ final class WakeWordDetector {
         awaitingSettle = false
         transcriber.cancel()
         stopSession()
+    }
+
+    /// Capture one command immediately WITHOUT the wake phrase — for conversational follow-ups
+    /// (after IRIS asked a question). Delivers via `onWakeWordDetected`; if the user stays silent
+    /// the capture times out and listening resumes normally.
+    func captureFollowUp() {
+        guard isRunning, !capturing else { return }
+        appState?.status = .listening
+        beginFreshCapture()
     }
 
     // MARK: - Recognition session
@@ -181,8 +217,10 @@ final class WakeWordDetector {
 
         input.removeTap(onBus: 0)   // safe even if no tap is installed; avoids double-tap crash
         input.installTap(onBus: 0, bufferSize: bufferSize, format: format) { [weak self] buffer, _ in
-            // Drop mic audio while IRIS is speaking so it never hears its own TTS.
-            guard let self, !self.isMuted else { return }
+            guard let self else { return }
+            // While IRIS speaks: if barge-in is ON keep feeding the recognizer (self-hearing is
+            // filtered in handleTranscript); if OFF, drop buffers so IRIS never hears its own TTS.
+            if self.isMuted && !self.bargeInEnabled { return }
             self.request?.append(buffer)
         }
         engine.prepare()
@@ -236,13 +274,23 @@ final class WakeWordDetector {
 
     private func handleTranscript(_ transcript: String) {
         guard !capturing else { return }
+        // Ignore the brief window right after IRIS stops talking (its audio tail can linger).
+        guard Date() >= speechCooldownUntil else { return }
         NSLog("[IRIS] heard: \"\(transcript)\"")
         guard transcript.lowercased().contains(settings.wakePhrase) else { return }
         NSLog("[IRIS] wake phrase matched → arming command capture")
 
+        // The wake phrase is the ONLY thing that interrupts IRIS mid-speech, so its own TTS or
+        // background noise can't self-trigger a barge-in. If IRIS is speaking, stop it now so it
+        // goes quiet immediately while we capture the new command.
+        if appState?.isSpeaking == true {
+            onBargeIn?()
+        }
+
         if !awaitingSettle {
             awaitingSettle = true
             appState?.status = .listening
+            onWakeDetected?()
         }
         latestWakeTranscript = transcript
         resetSettleTimer()
@@ -285,25 +333,42 @@ final class WakeWordDetector {
     }
 
     private func deliver(_ command: String) {
-        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Stop listening while the brain works and IRIS speaks; we re-arm afterward.
-        stopSession()
-        if !trimmed.isEmpty {
-            onWakeWordDetected?(trimmed)
-        } else {
+        capturing = false
+        // Rapid consecutive commands arrive as ONE transcript ("...screen hey iris what time
+        // is it"), and only the first wake phrase was stripped upstream. Split on any remaining
+        // wake phrases so each command is emitted (and handled concurrently) separately.
+        let commands = splitOnWakePhrase(command)
+        if commands.isEmpty {
             appState?.status = .idle
+        } else {
+            for c in commands { onWakeWordDetected?(c) }
         }
-        scheduleRearm()
-    }
-
-    private func scheduleRearm() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + rearmDebounce) { [weak self] in
-            guard let self, self.isRunning, !self.capturing else { return }
-            self.startSession()
-        }
+        // Keep listening so a second "hey iris" can interrupt while IRIS thinks/speaks
+        // (barge-in). Start a FRESH recognition session — new transcript, engine/tap stay
+        // up — rather than fully stopping. `startSession()` resets the wake bookkeeping.
+        // (With barge-in enabled the tap also stays live during `.speaking`, and IRIS's own
+        // TTS is filtered out via the self-hearing subtraction in handleTranscript.)
+        startSession()
     }
 
     // MARK: - Command extraction
+
+    /// Split a command string on any (additional) occurrences of the wake phrase, returning the
+    /// non-empty segments in order. "what's on my screen hey iris what time is it" →
+    /// ["what's on my screen", "what time is it"]. A string with no wake phrase yields itself.
+    private func splitOnWakePhrase(_ command: String) -> [String] {
+        let phrase = settings.wakePhrase
+        var segments: [String] = []
+        var remaining = Substring(command)
+        while let r = remaining.range(of: phrase, options: [.caseInsensitive]) {
+            let before = remaining[..<r.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !before.isEmpty { segments.append(before) }
+            remaining = remaining[r.upperBound...]
+        }
+        let tail = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { segments.append(tail) }
+        return segments
+    }
 
     /// Everything after the wake phrase, trimmed. If the phrase isn't present, the whole
     /// (trimmed) string is returned — used defensively on freshly captured commands too.

@@ -21,18 +21,29 @@ struct OverlayView: View {
     /// Physical notch width (0 on non-notched displays); the idle island hugs this.
     var notchWidth: CGFloat = 0
 
-    /// Show the island only when there's something to say or IRIS is active; otherwise the
-    /// real notch is left untouched.
+    /// Show the island only when there's something to say, IRIS is active, or background
+    /// agents are running; otherwise the real notch is left untouched.
     private var isVisible: Bool {
-        appState.status != .idle || !appState.responseText.isEmpty
+        appState.status != .idle || !displayText.isEmpty
+            || !appState.backgroundTasks.isEmpty
     }
 
-    private var hasText: Bool { !appState.responseText.isEmpty }
+    /// In realtime mode IRIS streams a live caption into `transcript`; the classic path uses
+    /// `responseText`. Show whichever is present.
+    private var displayText: String {
+        appState.responseText.isEmpty ? appState.transcript : appState.responseText
+    }
+
+    private var hasText: Bool { !displayText.isEmpty }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if isVisible {
+        VStack(spacing: 6) {
+            if appState.status != .idle || hasText {
                 island
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            if !appState.backgroundTasks.isEmpty {
+                agentList
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
             Spacer(minLength: 0)
@@ -41,6 +52,27 @@ struct OverlayView: View {
         .animation(.spring(response: 0.38, dampingFraction: 0.82), value: isVisible)
         .animation(.spring(response: 0.38, dampingFraction: 0.82), value: appState.responseText)
         .animation(.easeInOut(duration: 0.25), value: appState.status)
+        .animation(.spring(response: 0.40, dampingFraction: 0.85), value: appState.backgroundTasks)
+    }
+
+    /// Stacked pills showing each background agent task (capped, with a "+N more" row).
+    private var agentList: some View {
+        let tasks = appState.backgroundTasks
+        let shown = Array(tasks.prefix(4))
+        let extra = tasks.count - shown.count
+        return VStack(spacing: 5) {
+            ForEach(shown) { task in
+                AgentPillRow(task: task)
+            }
+            if extra > 0 {
+                Text("+\(extra) more")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+        }
+        // When the island is hidden (idle, no text), nudge the pills below the notch.
+        .padding(.top, (appState.status == .idle && !hasText) ? topInset + 6 : 0)
+        .frame(maxWidth: 360)
     }
 
     private var island: some View {
@@ -48,7 +80,7 @@ struct OverlayView: View {
             OrbView(status: appState.status)
 
             if hasText {
-                Text(appState.responseText)
+                Text(displayText)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.white)
                     .lineLimit(5)
@@ -102,6 +134,87 @@ struct OrbView: View {
             )
             .animation(.easeInOut(duration: 0.3), value: status)
             .onAppear { pulsing = true }
+    }
+}
+
+/// One background-agent task as a compact pill: a status dot + title + state/summary.
+struct AgentPillRow: View {
+    let task: AgentTask
+
+    private var color: Color {
+        switch task.state {
+        case .queued:    return .gray
+        case .running:   return .purple
+        case .succeeded: return .green
+        case .failed:    return .red
+        case .cancelled: return .gray
+        }
+    }
+
+    private var stateLabel: String {
+        switch task.state {
+        case .queued:    return "Queued…"
+        case .running:   return "Working…"
+        case .succeeded: return "Done"
+        case .failed:    return "Failed"
+        case .cancelled: return "Cancelled"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 9) {
+            AgentStatusDot(color: color, pulsing: task.state == .running)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(task.title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                if let summary = task.resultSummary, task.state.isFinished, !summary.isEmpty {
+                    Text(summary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text(stateLabel)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.black)
+                .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+        )
+    }
+}
+
+/// A small pulsing status dot for an agent pill (mirrors OrbView's pulse, scaled down).
+struct AgentStatusDot: View {
+    let color: Color
+    let pulsing: Bool
+
+    @State private var animate = false
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 10, height: 10)
+            .shadow(color: color.opacity(0.7), radius: pulsing ? 5 : 2)
+            .scaleEffect(pulsing && animate ? 1.35 : 1.0)
+            .animation(
+                pulsing
+                    ? .easeInOut(duration: 0.6).repeatForever(autoreverses: true)
+                    : .easeInOut(duration: 0.3),
+                value: animate
+            )
+            .onAppear { animate = true }
     }
 }
 

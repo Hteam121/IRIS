@@ -11,6 +11,10 @@
 
 import Foundation
 
+/// Unambiguous alias for the config struct. SwiftUI also defines a `Settings` scene type,
+/// so UI files (which import SwiftUI) reference the config via this alias to avoid the clash.
+public typealias IRISSettings = Settings
+
 public struct Settings: Sendable {
     /// Absolute path to the resolved `claude` CLI binary (best-effort; may be empty
     /// if not found, in which case the API path must be used).
@@ -19,6 +23,10 @@ public struct Settings: Sendable {
     /// Anthropic API key. When present, `IRISBrain` uses the Messages API with real
     /// base64 vision instead of `claude -p`.
     public var anthropicAPIKey: String?
+
+    /// OpenAI API key. When present, `IntentRouter` uses OpenAI function-calling to
+    /// classify each command into an action (open app / run agent / answer).
+    public var openAIAPIKey: String?
 
     /// Model id. Default `claude-sonnet-4-6`; `claude-haiku-4-5-20251001` for speed.
     public var model: String
@@ -36,29 +44,142 @@ public struct Settings: Sendable {
     /// Case-insensitive wake phrase, lowercased (see docs/algorithms.md → wake word).
     public var wakePhrase: String
 
+    // MARK: - Background agents (LangGraph sidecar)
+
+    /// Absolute path to the sidecar venv's Python (e.g. sidecar/.venv/bin/python). When set,
+    /// IRIS spawns the sidecar itself; when nil it only tries to connect to an already-running one.
+    public var sidecarPython: String?
+
+    /// Localhost port the sidecar serves on (must match the sidecar's IRIS_SIDECAR_PORT).
+    public var sidecarPort: Int
+
+    /// Default working directory for terminal / agent tasks (tilde expanded).
+    public var defaultAgentDirectory: String
+
+    /// Max background agents allowed to run at once (passed to the sidecar).
+    public var maxConcurrentAgents: Int
+
+    /// Whether voice barge-in (interrupt while speaking) is enabled.
+    public var bargeInEnabled: Bool
+
+    /// Model the sidecar agents reason with. Nil → the sidecar's own default
+    /// (foreground Q&A always uses `model`).
+    public var agentModel: String?
+
+    // MARK: - Neural voice (OpenAI TTS)
+
+    /// Use OpenAI neural TTS for a natural voice (when an OpenAI key is set). Falls back to the
+    /// built-in AVSpeechSynthesizer when false or on failure.
+    public var openAITTSEnabled: Bool
+
+    /// OpenAI TTS voice name (e.g. nova, alloy, shimmer, sage, coral, echo, onyx, fable, ash).
+    public var ttsVoice: String
+
+    /// OpenAI TTS model (gpt-4o-mini-tts supports the `instructions` tone steer).
+    public var ttsModel: String
+
+    /// Tone/style instructions for gpt-4o-mini-tts (how the voice should sound).
+    public var ttsInstructions: String
+
+    // MARK: - Realtime (Jarvis/Cluely speech-to-speech core)
+
+    /// Use the OpenAI Realtime API speech-to-speech core (continuous conversation) instead of the
+    /// classic wake-word → one-shot pipeline. Needs an OpenAI key.
+    public var realtimeEnabled: Bool
+
+    /// Realtime model id (e.g. gpt-realtime).
+    public var realtimeModel: String
+
+    /// Realtime voice (e.g. marin, cedar, alloy, ash, sage, verse).
+    public var realtimeVoice: String
+
+    /// Keep listening continuously (true) vs require a hotkey to talk (false).
+    public var alwaysOn: Bool
+
+    /// Pause the upstream after this many seconds of silence (cost control); resumes on sound.
+    public var idlePauseSeconds: Int
+
+    /// Allow IRIS to control the Mac (type/click) via Accessibility.
+    public var computerUseEnabled: Bool
+
+    /// Screen awareness: "onDemand" (model asks via a tool) or "proactive" (periodic capture).
+    public var screenAwareness: String
+
+    /// Try hardware echo cancellation (full-duplex barge-in). Flaky on some Macs (the engine can
+    /// fail to deliver input), so default OFF → reliable half-duplex (mic muted while IRIS speaks).
+    public var echoCancellation: Bool
+
     // MARK: - Defaults
 
     public static let defaultModel = "claude-sonnet-4-6"
     public static let defaultVoice = "en-US"
     public static let defaultTTSRate: Float = 0.52
     public static let defaultWakePhrase = "hey iris"
+    public static let defaultSidecarPort = 8765
+    public static let defaultMaxConcurrentAgents = 4
+    public static let defaultTTSVoice = "sage"
+    public static let defaultTTSModel = "gpt-4o-mini-tts"
+    public static let defaultTTSInstructions =
+        "Speak in a warm, natural, conversational tone, like a friendly person chatting — "
+        + "relaxed pacing, not robotic or overly formal."
+    public static let defaultRealtimeModel = "gpt-realtime"
+    public static let defaultRealtimeVoice = "marin"
+    public static let defaultIdlePauseSeconds = 15
 
     public init(
         claudeBinary: String,
         anthropicAPIKey: String?,
+        openAIAPIKey: String?,
         model: String,
         voice: String,
         voiceIdentifier: String?,
         ttsRate: Float,
-        wakePhrase: String
+        wakePhrase: String,
+        sidecarPython: String? = nil,
+        sidecarPort: Int = Settings.defaultSidecarPort,
+        defaultAgentDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path,
+        maxConcurrentAgents: Int = Settings.defaultMaxConcurrentAgents,
+        bargeInEnabled: Bool = false,
+        agentModel: String? = nil,
+        openAITTSEnabled: Bool = true,
+        ttsVoice: String = Settings.defaultTTSVoice,
+        ttsModel: String = Settings.defaultTTSModel,
+        ttsInstructions: String = Settings.defaultTTSInstructions,
+        realtimeEnabled: Bool = true,
+        realtimeModel: String = Settings.defaultRealtimeModel,
+        realtimeVoice: String = Settings.defaultRealtimeVoice,
+        alwaysOn: Bool = true,
+        idlePauseSeconds: Int = Settings.defaultIdlePauseSeconds,
+        computerUseEnabled: Bool = true,
+        screenAwareness: String = "onDemand",
+        echoCancellation: Bool = false
     ) {
         self.claudeBinary = claudeBinary
         self.anthropicAPIKey = anthropicAPIKey
+        self.openAIAPIKey = openAIAPIKey
         self.model = model
         self.voice = voice
         self.voiceIdentifier = voiceIdentifier
         self.ttsRate = ttsRate
         self.wakePhrase = wakePhrase
+        self.sidecarPython = sidecarPython
+        self.sidecarPort = sidecarPort
+        self.defaultAgentDirectory = defaultAgentDirectory
+        self.maxConcurrentAgents = maxConcurrentAgents
+        self.bargeInEnabled = bargeInEnabled
+        self.agentModel = agentModel
+        self.openAITTSEnabled = openAITTSEnabled
+        self.ttsVoice = ttsVoice
+        self.ttsModel = ttsModel
+        self.ttsInstructions = ttsInstructions
+        self.realtimeEnabled = realtimeEnabled
+        self.realtimeModel = realtimeModel
+        self.realtimeVoice = realtimeVoice
+        self.alwaysOn = alwaysOn
+        self.idlePauseSeconds = idlePauseSeconds
+        self.computerUseEnabled = computerUseEnabled
+        self.screenAwareness = screenAwareness
+        self.echoCancellation = echoCancellation
     }
 
     // MARK: - Loading
@@ -75,6 +196,7 @@ public struct Settings: Sendable {
         }
 
         let apiKey = value("anthropicAPIKey", "ANTHROPIC_API_KEY")
+        let openAIKey = value("openAIAPIKey", "OPENAI_API_KEY")
 
         let model = value("model", "IRIS_MODEL") ?? defaultModel
         let voice = value("voice", "IRIS_VOICE") ?? defaultVoice
@@ -92,15 +214,125 @@ public struct Settings: Sendable {
         let claudeBinary = value("claudeBinary", "IRIS_CLAUDE_BINARY")
             ?? resolveClaudeBinary()
 
+        // Background-agent sidecar config.
+        let sidecarPython = value("sidecarPython", "IRIS_SIDECAR_PYTHON")
+        let sidecarPort = value("sidecarPort", "IRIS_SIDECAR_PORT").flatMap(Int.init)
+            ?? defaultSidecarPort
+        let defaultAgentDir = (value("defaultAgentDirectory", "IRIS_AGENT_DIR")
+            .map { ($0 as NSString).expandingTildeInPath })
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let maxAgents = value("maxConcurrentAgents", "IRIS_MAX_AGENTS").flatMap(Int.init)
+            ?? defaultMaxConcurrentAgents
+        // Default OFF: keeping the mic live during TTS (for voice barge-in) causes a self-hearing
+        // feedback loop without hardware echo cancellation. ⌥⎋ interrupts during speech instead;
+        // seamless voice barge-in arrives with the Realtime speech-to-speech step. Power users can
+        // re-enable with IRIS_BARGE_IN=1 / "bargeInEnabled": true.
+        let bargeIn = parseBool(value("bargeInEnabled", "IRIS_BARGE_IN")) ?? false
+        let agentModel = value("agentModel", "IRIS_AGENT_MODEL")
+
+        // Neural voice (OpenAI TTS).
+        let openAITTS = parseBool(value("openAITTSEnabled", "IRIS_OPENAI_TTS")) ?? true
+        let ttsVoice = value("ttsVoice", "IRIS_TTS_VOICE") ?? defaultTTSVoice
+        let ttsModel = value("ttsModel", "IRIS_TTS_MODEL") ?? defaultTTSModel
+        let ttsInstructions = value("ttsInstructions", "IRIS_TTS_INSTRUCTIONS")
+            ?? defaultTTSInstructions
+
+        // Realtime core.
+        let realtimeEnabled = parseBool(value("realtimeEnabled", "IRIS_REALTIME")) ?? true
+        let realtimeModel = value("realtimeModel", "IRIS_REALTIME_MODEL") ?? defaultRealtimeModel
+        let realtimeVoice = value("realtimeVoice", "IRIS_REALTIME_VOICE") ?? defaultRealtimeVoice
+        let alwaysOn = parseBool(value("alwaysOn", "IRIS_ALWAYS_ON")) ?? true
+        let idlePause = value("idlePauseSeconds", "IRIS_IDLE_PAUSE").flatMap(Int.init)
+            ?? defaultIdlePauseSeconds
+        let computerUse = parseBool(value("computerUseEnabled", "IRIS_COMPUTER_USE")) ?? true
+        let screenAwareness = value("screenAwareness", "IRIS_SCREEN_AWARENESS") ?? "onDemand"
+        let echoCancellation = parseBool(value("echoCancellation", "IRIS_ECHO_CANCEL")) ?? false
+
         return Settings(
             claudeBinary: claudeBinary,
             anthropicAPIKey: apiKey,
+            openAIAPIKey: openAIKey,
             model: model,
             voice: voice,
             voiceIdentifier: voiceIdentifier,
             ttsRate: ttsRate,
-            wakePhrase: wakePhrase
+            wakePhrase: wakePhrase,
+            sidecarPython: sidecarPython,
+            sidecarPort: sidecarPort,
+            defaultAgentDirectory: defaultAgentDir,
+            maxConcurrentAgents: maxAgents,
+            bargeInEnabled: bargeIn,
+            agentModel: agentModel,
+            openAITTSEnabled: openAITTS,
+            ttsVoice: ttsVoice,
+            ttsModel: ttsModel,
+            ttsInstructions: ttsInstructions,
+            realtimeEnabled: realtimeEnabled,
+            realtimeModel: realtimeModel,
+            realtimeVoice: realtimeVoice,
+            alwaysOn: alwaysOn,
+            idlePauseSeconds: idlePause,
+            computerUseEnabled: computerUse,
+            screenAwareness: screenAwareness,
+            echoCancellation: echoCancellation
         )
+    }
+
+    /// Parse a loosely-typed truthy/falsy config string. Returns nil when unset/unrecognized.
+    private static func parseBool(_ s: String?) -> Bool? {
+        guard let s = s?.trimmingCharacters(in: .whitespaces).lowercased(), !s.isEmpty else {
+            return nil
+        }
+        if ["1", "true", "yes", "on"].contains(s) { return true }
+        if ["0", "false", "no", "off"].contains(s) { return false }
+        return nil
+    }
+
+    // MARK: - Persistence (menu-bar Settings write-back)
+
+    /// Return a copy with updated API keys / model — used by the Settings window before
+    /// saving and re-applying. Empty strings are normalized to `nil` (key cleared).
+    public func withUpdatedKeys(anthropic: String, openAI: String, model: String) -> Settings {
+        func nilIfEmpty(_ s: String) -> String? {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.isEmpty ? nil : t
+        }
+        var copy = self
+        copy.anthropicAPIKey = nilIfEmpty(anthropic)
+        copy.openAIAPIKey = nilIfEmpty(openAI)
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.model = trimmedModel.isEmpty ? Settings.defaultModel : trimmedModel
+        return copy
+    }
+
+    /// Persist the user-editable fields to `~/.iris/config.json`, merging with whatever is
+    /// already there so keys we don't manage survive. The secrets live OUTSIDE the repo, so
+    /// they can never be committed (see scripts/pre-commit for the staging guard).
+    public func save() throws {
+        let fm = FileManager.default
+        let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".iris", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("config.json")
+
+        // Start from the existing file so unknown keys aren't clobbered.
+        var obj: [String: Any] = (try? Data(contentsOf: url))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+
+        func put(_ key: String, _ v: String?) {
+            if let v, !v.isEmpty { obj[key] = v } else { obj.removeValue(forKey: key) }
+        }
+        put("anthropicAPIKey", anthropicAPIKey)
+        put("openAIAPIKey", openAIAPIKey)
+        put("voiceIdentifier", voiceIdentifier)
+        obj["model"] = model
+        obj["voice"] = voice
+        obj["wakePhrase"] = wakePhrase
+        obj["ttsRate"] = ttsRate
+        // claudeBinary is deliberately NOT written — preserve the auto-probe on next launch.
+
+        let data = try JSONSerialization.data(
+            withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
     }
 
     // MARK: - claude binary resolution (plan.md fix #1)

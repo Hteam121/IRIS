@@ -33,6 +33,20 @@ public final class AppState: ObservableObject {
     /// this is true, so IRIS doesn't hear and transcribe its own speech (plan.md fix #5).
     @Published public var isSpeaking: Bool = false
 
+    /// The text IRIS is currently speaking (empty when idle). Used by the wake detector's
+    /// barge-in self-hearing filter to subtract IRIS's own voice from the recognizer.
+    @Published public var spokenText: String = ""
+
+    /// Live set of autonomous background agent tasks (run by the LangGraph sidecar).
+    /// Rendered by the overlay/menu so multiple agents can be shown running in parallel.
+    ///
+    /// NOTE: additive Phase-0 exception — see docs/timeline/2026-06-24.md. Existing fields
+    /// and their observers are untouched.
+    @Published public var backgroundTasks: [AgentTask] = []
+
+    /// Live caption of the realtime conversation (what IRIS is currently saying/heard).
+    @Published public var transcript: String = ""
+
     public init() {}
 }
 

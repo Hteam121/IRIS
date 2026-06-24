@@ -34,5 +34,8 @@
 	<string>IRIS transcribes your speech to understand commands.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>IRIS captures your screen so it can answer questions about what you're looking at.</string>
+	<!-- Automation: IRIS opens Terminal to start Claude Code sessions you ask for. -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>IRIS opens Terminal to start coding sessions you ask for.</string>
 </dict>
 </plist>
