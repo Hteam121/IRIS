@@ -39,6 +39,21 @@ final class RealtimeAudio: @unchecked Sendable {
     private(set) var isRunning = false
     private(set) var aecActive = false
 
+    // Tracks ACTUAL speaker playback (queued buffers + a short decay grace) so the mic can be
+    // muted in half-duplex mode until IRIS's own voice has fully stopped coming out of the
+    // speaker — keying mute on the WebSocket "response.done" event left a tail that the mic heard,
+    // causing IRIS to interrupt itself in a loop.
+    private let playLock = NSLock()
+    private var pendingBuffers = 0
+    private var lastOutputAt = Date.distantPast
+    private let outputGrace: TimeInterval = 0.6
+
+    /// True while model audio is actually playing (or within the decay grace just after).
+    var isOutputting: Bool {
+        playLock.lock(); defer { playLock.unlock() }
+        return pendingBuffers > 0 || Date().timeIntervalSince(lastOutputAt) < outputGrace
+    }
+
     private let countLock = NSLock()
     private var bufferCount = 0
     private var bufferCountValue: Int { countLock.lock(); defer { countLock.unlock() }; return bufferCount }
@@ -119,19 +134,28 @@ final class RealtimeAudio: @unchecked Sendable {
         player.stop()
         if engine.isRunning { engine.stop() }
         isRunning = false
+        playLock.lock(); pendingBuffers = 0; lastOutputAt = .distantPast; playLock.unlock()
     }
 
     /// Barge-in: drop any queued/playing output immediately.
     func stopPlayback() {
         guard isRunning else { return }
         player.stop()
+        playLock.lock(); pendingBuffers = 0; lastOutputAt = Date(); playLock.unlock()
         player.play()
     }
 
     /// Play a chunk of 24 kHz mono PCM16 audio from the model.
     func playPCM16(_ data: Data) {
         guard isRunning, let converted = makeOutputBuffer(from: data) else { return }
-        player.scheduleBuffer(converted, completionHandler: nil)
+        playLock.lock(); pendingBuffers += 1; lastOutputAt = Date(); playLock.unlock()
+        player.scheduleBuffer(converted, completionHandler: { [weak self] in
+            guard let self else { return }
+            self.playLock.lock()
+            self.pendingBuffers = max(0, self.pendingBuffers - 1)
+            self.lastOutputAt = Date()
+            self.playLock.unlock()
+        })
         if !player.isPlaying { player.play() }
     }
 

@@ -189,9 +189,11 @@ final class RealtimeSession {
     private func startAudio(attempt: Int = 0) {
         audio.onMicPCM16 = { [weak self] data in
             guard let self else { return }
-            // Half-duplex when AEC is unavailable: don't feed the mic while IRIS is speaking
-            // (stops the mic hearing IRIS and looping). With AEC on we always stream → barge-in.
-            if !self.audio.aecActive && self.modelSpeaking.value { return }
+            // Half-duplex when AEC is unavailable: don't feed the mic while IRIS's audio is
+            // actually playing out the speaker (+ a short decay grace) — this is tied to real
+            // playback, not the WS event, so the mic never hears IRIS's tail and loops. With AEC
+            // on we always stream → true barge-in.
+            if !self.audio.aecActive && self.audio.isOutputting { return }
             self.sendRaw(["type": "input_audio_buffer.append", "audio": data.base64EncodedString()])
         }
         do {
