@@ -121,6 +121,18 @@ settings:
 In Xcode press **▶︎ Run** (or `⌘R`). IRIS launches as a menu-bar app (look for the 👁 in the menu
 bar — there's no dock icon). On first launch, grant the permissions below.
 
+### Run it like a normal app (no Xcode each time)
+
+To stop launching from Xcode, build a Release copy and drop it in `/Applications`:
+
+```bash
+./scripts/install-app.sh
+```
+
+This builds a Release `IRIS.app`, installs it to **`/Applications`**, and launches it. From then on
+it's a normal app — open it from Spotlight/Finder, or add it to **System Settings → General → Login
+Items** to start at boot. (Building still needs Xcode; *running* the installed app does not.)
+
 ### 6. (Optional) Background-agents sidecar
 
 For long-running research/agent tasks, set up the Python sidecar:
@@ -242,6 +254,24 @@ a running change log in `docs/timeline/`.
 | **Logs** | IRIS writes to `~/.iris/iris.log` — `tail -f ~/.iris/iris.log`. |
 
 ---
+
+## Distributing IRIS (it's open source)
+
+IRIS is open source under the [MIT license](LICENSE) — anyone can clone, build, modify, and
+redistribute it. Two distinct audiences:
+
+- **Developers** clone the repo and build from source (needs Xcode + `xcodegen`).
+- **Everyone else** should get a **pre-built `IRIS.app`** and just double-click it — they need
+  **no Xcode and no toolchain**, because macOS ships the Swift runtime.
+
+To publish builds others can run without a toolchain, the maintainer signs the app with a
+**Developer ID** certificate and **notarizes** it with Apple (`notarytool` + `stapler`), then
+uploads a `.dmg`/`.zip` to **GitHub Releases**. Notarization (a paid Apple Developer account) is
+what lets recipients open it with no Gatekeeper warning. Open source and signed binaries coexist
+fine: the source stays public, while the official downloads are signed by the maintainer's
+identity (your signing certificate is a secret and never goes in the repo — forks sign with their
+own). Two honest caveats for downloaders: IRIS still needs the **`claude` CLI** (a Claude login)
+for its brain and an **OpenAI key** for real-time voice, so a first run involves a little setup.
 
 ## Project layout
 
