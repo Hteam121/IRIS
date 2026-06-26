@@ -21,6 +21,7 @@ struct SidecarTaskEvent: Decodable, Sendable {
     let state: AgentTaskState
     let summary: String?
     let detail: String?
+    let question: String?   // set when state == .waitingForUser (the agent's question)
 }
 
 @MainActor
@@ -153,6 +154,16 @@ final class SidecarClient {
         var req = URLRequest(url: baseURL.appendingPathComponent("tasks/\(id)/cancel"))
         req.httpMethod = "POST"
         req.timeoutInterval = 5
+        _ = try? await session.data(for: req)
+    }
+
+    /// Resume a paused (human-in-the-loop) task with the user's answer.
+    func resume(_ id: String, answer: String) async {
+        var req = URLRequest(url: baseURL.appendingPathComponent("tasks/\(id)/resume"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 5
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["answer": answer])
         _ = try? await session.data(for: req)
     }
 

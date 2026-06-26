@@ -5,6 +5,7 @@ Endpoints (consumed by IRIS/AI/SidecarClient.swift):
     POST /tasks             -> {"id": "<hex>"}                 (starts a task, non-blocking)
     GET  /events            -> text/event-stream of TaskEvent   (all tasks, one stream)
     POST /tasks/{id}/cancel -> {"cancelled": bool}
+    POST /tasks/{id}/resume -> {"resumed": bool}                (answer a paused task's question)
 
 Run:  uvicorn iris_agents.server:app --host 127.0.0.1 --port 8765
 or:   python -m iris_agents.server   (honors IRIS_SIDECAR_PORT / IRIS_SIDECAR_HOST)
@@ -21,7 +22,7 @@ from fastapi.responses import StreamingResponse
 
 from . import __version__
 from .manager import TaskManager
-from .models import TaskRequest
+from .models import ResumeRequest, TaskRequest
 
 # Load sidecar/.env if present (does not override vars IRIS already passed in the spawn env).
 try:
@@ -55,6 +56,14 @@ async def create_task(req: TaskRequest) -> dict:
 @app.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str) -> dict:
     return {"cancelled": manager.cancel(task_id)}
+
+
+@app.post("/tasks/{task_id}/resume")
+async def resume_task(task_id: str, req: ResumeRequest) -> dict:
+    """Resume a paused (human-in-the-loop) task with the user's answer."""
+    ok = manager.resume(task_id, req.answer)
+    log.info("resume task %s ok=%s answer=%r", task_id, ok, req.answer[:80])
+    return {"resumed": ok}
 
 
 @app.get("/events")

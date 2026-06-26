@@ -23,9 +23,18 @@ DEFAULT_MODEL = os.environ.get("IRIS_AGENT_MODEL", "claude-sonnet-4-6")
 SYSTEM_PROMPT = (
     "You are an IRIS background agent operating autonomously on the user's Mac. "
     "Carry out the task using the tools available to you. Be efficient and decisive. "
+    "If a website blocks you or a source fails, try other reputable sources on your own before "
+    "giving up — don't stop at the first obstacle. "
+    "Only use the ask_user tool when you are genuinely stuck or a real choice is needed (e.g. you "
+    "need permission to look somewhere else, or a missing detail only the user knows); ask ONE "
+    "short question and then continue once they answer. "
     "When finished, reply with ONE concise sentence that will be spoken aloud — "
     "plain prose only, no markdown, lists, code fences, emoji, or raw URLs read verbatim."
 )
+
+
+class AgentUnavailable(Exception):
+    """Raised when the agent can't run (no API key); the manager surfaces a friendly message."""
 
 
 def title_for(req: TaskRequest) -> str:
@@ -62,15 +71,72 @@ def _seed_message(req: TaskRequest) -> str:
     return detail
 
 
-async def run_task(req: TaskRequest) -> str:
-    """Run the agent to completion and return a spoken summary sentence."""
-    try:
-        return await _run_react_agent(req)
-    except ImportError as exc:
-        log.warning("agent dependencies unavailable, returning stub: %s", exc)
-        return (
-            f"I can't run that yet — the agent dependencies aren't installed. ({req.detail})"
-        )
+class AgentRun:
+    """A resumable ReAct agent run for one task. Holds the compiled graph + checkpointer + config
+    so a `paused` run (the agent called ask_user → LangGraph interrupt) can be resumed later with
+    the user's answer via `resume()`. `start()`/`resume()` both return a status dict:
+      {"status": "done", "summary": <sentence>}  or  {"status": "paused", "question": <text>}.
+    """
+
+    def __init__(self, agent, config, seed_messages) -> None:
+        self._agent = agent
+        self._config = config
+        self._seed = seed_messages
+
+    async def start(self) -> dict:
+        result = await self._agent.ainvoke({"messages": self._seed}, config=self._config)
+        return self._interpret(result)
+
+    async def resume(self, answer: str) -> dict:
+        from langgraph.types import Command
+        result = await self._agent.ainvoke(Command(resume=answer), config=self._config)
+        return self._interpret(result)
+
+    @staticmethod
+    def _interpret(result) -> dict:
+        interrupts = result.get("__interrupt__") if isinstance(result, dict) else None
+        if interrupts:
+            intr = interrupts[0]
+            val = getattr(intr, "value", intr)
+            question = val.get("question") if isinstance(val, dict) else str(val)
+            return {"status": "paused", "question": question or "I need a decision from you."}
+        return {"status": "done", "summary": _final_text(result)}
+
+
+async def build_run(task_id: str, req: TaskRequest) -> AgentRun:
+    """Build a resumable agent for `req`. Raises ImportError if deps are missing, or
+    AgentUnavailable if no API key is configured."""
+    # Lazy heavy imports (keeps the server bootable in a degraded, deps-missing mode).
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_core.tools import tool
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.prebuilt import create_react_agent
+    from langgraph.types import interrupt
+
+    from .tools import tools_for
+
+    llm = _make_llm(req.model)
+    if llm is None:
+        raise AgentUnavailable("no API key set for the sidecar (OPENAI_API_KEY or ANTHROPIC_API_KEY)")
+
+    @tool
+    def ask_user(question: str) -> str:
+        """Ask the user a single question and wait for their spoken answer. Use ONLY when genuinely
+        stuck or a real choice is needed (e.g. a site is blocked and you need permission to try
+        elsewhere). Returns the user's answer."""
+        return interrupt({"question": question})
+
+    tools = list(await tools_for(req.kind))
+    if req.kind in (TaskKind.web, TaskKind.agent):
+        tools.append(ask_user)
+
+    agent = create_react_agent(llm, tools, checkpointer=MemorySaver())
+    config = {
+        "configurable": {"thread_id": task_id},
+        "recursion_limit": int(os.environ.get("IRIS_RECURSION_LIMIT", "40")),
+    }
+    seed = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=_seed_message(req))]
+    return AgentRun(agent, config, seed)
 
 
 def _make_llm(model: str | None):
@@ -94,35 +160,6 @@ def _make_llm(model: str | None):
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(model="claude-sonnet-4-6", max_tokens=1024, timeout=120, max_retries=2)
     return None
-
-
-async def _run_react_agent(req: TaskRequest) -> str:
-    # Lazy heavy imports.
-    from langchain_core.messages import HumanMessage, SystemMessage
-    from langgraph.prebuilt import create_react_agent
-
-    from .tools import tools_for
-
-    llm = _make_llm(req.model)
-    if llm is None:
-        return (
-            "I can't run background tasks without an API key — set OPENAI_API_KEY "
-            "(or ANTHROPIC_API_KEY) for the sidecar."
-        )
-
-    tools = await tools_for(req.kind)
-    agent = create_react_agent(llm, tools)
-
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=_seed_message(req)),
-    ]
-    # Cap the loop so a confused agent can't run forever.
-    result = await agent.ainvoke(
-        {"messages": messages},
-        config={"recursion_limit": int(os.environ.get("IRIS_RECURSION_LIMIT", "40"))},
-    )
-    return _final_text(result)
 
 
 def _final_text(result) -> str:

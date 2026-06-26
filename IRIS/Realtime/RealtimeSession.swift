@@ -26,6 +26,12 @@ final class RealtimeSession {
     private weak var appState: AppState?
     private weak var agentManager: AgentManager?
     private let screenCapture: ScreenCapture
+    /// The persistent brain. Its contents are folded into the model's instructions so IRIS recalls
+    /// what it has learned, and the `remember`/`forget` tools write back to it mid-conversation.
+    private let memory: MemoryStore?
+
+    /// Meters realtime spend (exact, from each turn's `usage`) against the monthly budget.
+    private weak var costGovernor: CostGovernor?
 
     private let audio = RealtimeAudio()
     private let urlSession = URLSession(configuration: .default)
@@ -38,6 +44,10 @@ final class RealtimeSession {
     /// Fires when the conversation has been idle (no speech) for `idlePauseSeconds` — AppDelegate
     /// pauses the stream and returns to wake-word listening.
     var onIdleTimeout: (() -> Void)?
+    /// Fires when a turn's metered spend pushes the budget past the cap mid-conversation — AppDelegate
+    /// ends the paid stream now (next wake falls back to the free `claude -p` pipeline) instead of
+    /// letting a single long sitting blow past the monthly budget.
+    var onBudgetExhausted: (() -> Void)?
     private var idleTimer: Timer?
     private var hideGen = 0
 
@@ -46,12 +56,28 @@ final class RealtimeSession {
     private var pendingAnnouncements: [String] = []
     private var responseActive = false
 
+    /// True after IRIS's last spoken turn ended with a question — extends the idle grace so the
+    /// user has time to answer before the session sleeps. Cleared when the user starts speaking.
+    private var lastReplyWasQuestion = false
+    /// True while the user is actively speaking (between server-VAD speech_started/speech_stopped).
+    /// The idle timer is suspended during this window so a long utterance never trips "no speech".
+    private var userSpeaking = false
+    /// Set by AppDelegate when a background task is waiting on the user's answer — also extends the
+    /// idle grace so the answer isn't cut off.
+    var awaitingAnswer = false
+    /// One-shot system-context messages to inject once the session is ready (e.g. on re-wake, to
+    /// surface an in-flight background task or re-ask a task's pending question).
+    private var pendingContext: [(text: String, respond: Bool)] = []
+    private var sessionReady = false
+
     init(settings: Settings, appState: AppState, agentManager: AgentManager?,
-         screenCapture: ScreenCapture) {
+         screenCapture: ScreenCapture, memory: MemoryStore?, costGovernor: CostGovernor? = nil) {
         self.settings = settings
         self.appState = appState
         self.agentManager = agentManager
         self.screenCapture = screenCapture
+        self.memory = memory
+        self.costGovernor = costGovernor
     }
 
     private static let persona = """
@@ -63,8 +89,35 @@ final class RealtimeSession {
     over explaining: when the user asks for something, call the right tool(s), chaining several when \
     a task needs multiple steps. Ask a brief clarifying question only when you truly need to. Before \
     anything destructive (deleting, sending, overwriting), confirm first. Never read URLs, code, or \
-    long lists aloud — summarize.
+    long lists aloud — summarize. \
+    You have a long-term memory: when the user teaches you a durable preference, gives a standing \
+    instruction ("from now on", "always", "next time", "don't ask again"), or corrects you, call \
+    the `remember` tool and briefly say you'll remember it. For a recurring on-screen step (like a \
+    confirmation dialog) also pass a `trigger` describing what's on screen and an `action` like \
+    "press enter". Keep memories short and don't save ones you already have; use `forget` to drop \
+    something. Apply what you've learned proactively, without being asked. \
+    Don't open apps or websites the user didn't ask for. For a research or shopping request, pick \
+    ONE approach — either run a background task OR do a web search, not both. When a background \
+    task needs a decision it will ask through you: relay its question, and once the user answers \
+    call `answer_task` with their reply. If the user wants to redirect a running task ("look \
+    elsewhere", "try Amazon instead"), call `redirect_task` with their new instruction.
     """
+
+    /// The model's instructions = persona + the learned-memory block (so IRIS recalls what it
+    /// knows). Recomputed whenever memory changes; sent via `session.update`.
+    private func instructions() -> String {
+        guard settings.memoryEnabled, let memory else { return Self.persona }
+        let block = memory.promptBlock(limit: 40)
+        return block.isEmpty ? Self.persona : Self.persona + "\n\n" + block
+    }
+
+    /// Push updated instructions to the live session after the brain changes mid-conversation
+    /// (e.g. right after a `remember`/`forget` tool call), so new learning takes effect at once.
+    private func refreshInstructions() {
+        guard shouldRun else { return }
+        send(["type": "session.update",
+              "session": ["type": "realtime", "instructions": instructions()]])
+    }
 
     // MARK: - Lifecycle
 
@@ -76,6 +129,7 @@ final class RealtimeSession {
 
     func stop() {
         shouldRun = false
+        userSpeaking = false
         idleTimer?.invalidate(); idleTimer = nil
         audio.stop()
         socket?.cancel(with: .goingAway, reason: nil)
@@ -85,9 +139,15 @@ final class RealtimeSession {
     // MARK: - Idle / hide
 
     /// (Re)start the no-speech countdown; firing it pauses the session back to wake-word listening.
+    /// When IRIS just asked a question (or a background task is waiting on the user), use a much
+    /// longer grace so the answer isn't cut off by the normal short idle pause.
     private func resetIdleTimer() {
         idleTimer?.invalidate()
-        let secs = TimeInterval(max(5, settings.idlePauseSeconds))
+        // Never sleep while the user is mid-utterance — a long request can exceed the idle window
+        // and should not be cut off. The timer restarts when they stop speaking (speech_stopped).
+        guard !userSpeaking else { idleTimer = nil; return }
+        let base = max(5, settings.idlePauseSeconds)
+        let secs = TimeInterval((lastReplyWasQuestion || awaitingAnswer) ? max(45, base) : base)
         idleTimer = Timer.scheduledTimer(withTimeInterval: secs, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.shouldRun else { return }
@@ -118,6 +178,35 @@ final class RealtimeSession {
         guard shouldRun, !text.isEmpty else { return }
         pendingAnnouncements.append(text)
         flushAnnouncements()
+    }
+
+    /// Inject a one-shot system-context message once the session is ready. Used on re-wake to tell
+    /// the model about an in-flight background task or to re-ask a task's pending question. When
+    /// `respond` is true, IRIS speaks immediately (e.g. to re-ask the question); otherwise it just
+    /// holds the context until the user speaks.
+    func primeContext(_ text: String, respond: Bool = false) {
+        guard shouldRun, !text.isEmpty else { return }
+        pendingContext.append((text, respond))
+        flushContext()
+    }
+
+    private func flushContext() {
+        guard shouldRun, sessionReady, !pendingContext.isEmpty else { return }
+        let items = pendingContext
+        pendingContext.removeAll()
+        var wantsResponse = false
+        for item in items {
+            send([
+                "type": "conversation.item.create",
+                "item": ["type": "message", "role": "system",
+                         "content": [["type": "input_text", "text": item.text]]],
+            ])
+            if item.respond { wantsResponse = true }
+        }
+        if wantsResponse, !responseActive {
+            send(["type": "response.create"])
+            responseActive = true
+        }
     }
 
     private func flushAnnouncements() {
@@ -153,6 +242,8 @@ final class RealtimeSession {
         task.resume()
         IRISLog.log("realtime: connecting to \(settings.realtimeModel)")
 
+        sessionReady = false
+        userSpeaking = false
         configureSession()
         receive()
         startAudio()
@@ -164,7 +255,7 @@ final class RealtimeSession {
         // PCM at 24 kHz, server VAD for turn-taking + barge-in.
         let sessionObj: [String: Any] = [
             "type": "realtime",
-            "instructions": Self.persona,
+            "instructions": instructions(),
             "audio": [
                 "input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
@@ -180,7 +271,8 @@ final class RealtimeSession {
                     "voice": settings.realtimeVoice,
                 ],
             ],
-            "tools": RealtimeTools.schemas(computerUse: settings.computerUseEnabled),
+            "tools": RealtimeTools.schemas(computerUse: settings.computerUseEnabled,
+                                           memoryEnabled: settings.memoryEnabled),
             "tool_choice": "auto",
         ]
         send(["type": "session.update", "session": sessionObj])
@@ -273,13 +365,23 @@ final class RealtimeSession {
             IRISLog.log("realtime: session.created")
         case "session.updated":
             IRISLog.log("realtime: session.updated (ready)")
+            sessionReady = true
+            flushContext()   // inject any queued re-wake context now that the session is live
 
         case "input_audio_buffer.speech_started":
             // User started talking — barge in: drop IRIS's current audio and listen.
             audio.stopPlayback()
             modelSpeaking.set(false)
+            lastReplyWasQuestion = false   // the user is responding; back to normal idle grace
+            userSpeaking = true            // suspend the idle timer for the whole utterance
             hideGen += 1                 // cancel any pending hide
             appState?.status = .listening
+            resetIdleTimer()
+
+        case "input_audio_buffer.speech_stopped":
+            // User finished an utterance — start the silence countdown from now (not from when
+            // they began), so a long request never trips the idle pause mid-sentence.
+            userSpeaking = false
             resetIdleTimer()
 
         case "response.created":
@@ -303,12 +405,22 @@ final class RealtimeSession {
             }
 
         case "response.output_audio_transcript.done", "response.audio_transcript.done":
-            if let text = obj["transcript"] as? String { appState?.transcript = text }
+            if let text = obj["transcript"] as? String {
+                appState?.transcript = text
+                // If IRIS just asked something, keep listening longer for the answer.
+                lastReplyWasQuestion = text.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+            }
 
         case "response.function_call_arguments.done":
             handleToolCall(obj)
 
         case "response.done":
+            // Meter this turn's exact spend against the monthly budget (audio/text in+out,
+            // cached vs uncached) before resetting state.
+            if let resp = obj["response"] as? [String: Any],
+               let usage = resp["usage"] as? [String: Any] {
+                costGovernor?.recordRealtime(usage: usage)
+            }
             // IRIS finished talking: hide the overlay shortly after, and restart the idle clock.
             responseActive = false
             modelSpeaking.set(false)
@@ -316,6 +428,13 @@ final class RealtimeSession {
             scheduleHide()
             resetIdleTimer()
             flushAnnouncements()   // speak any queued background-task results next
+            // Hard budget ceiling: if this turn's spend pushed us out of the premium tier, end the
+            // paid session now rather than waiting for the idle timer — otherwise a single long
+            // back-and-forth (idle timer resets each turn) can run far past the monthly cap.
+            if costGovernor?.allowsRealtime == false {
+                IRISLog.log("realtime: budget exhausted mid-session — ending paid stream")
+                onBudgetExhausted?()
+            }
 
         case "error":
             let msg = (obj["error"] as? [String: Any])?["message"] as? String ?? raw
@@ -336,7 +455,10 @@ final class RealtimeSession {
         Task { @MainActor in
             let result = await RealtimeTools.run(
                 name: name, args: args, settings: settings,
-                agentManager: agentManager, screenCapture: screenCapture)
+                agentManager: agentManager, screenCapture: screenCapture, memory: memory,
+                costGovernor: costGovernor)
+            // Memory changed mid-conversation → push refreshed instructions so it applies now.
+            if name == "remember" || name == "forget" { refreshInstructions() }
             send([
                 "type": "conversation.item.create",
                 "item": ["type": "function_call_output", "call_id": callId, "output": result],

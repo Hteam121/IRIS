@@ -32,6 +32,11 @@ enum Intent: Equatable {
 struct IntentRouter {
     let settings: Settings
     let urlSession: URLSession
+    /// Meters/gates the paid OpenAI classifier. When set and the budget allows paid calls
+    /// (`allowsPaidVision`), the fast gpt-4o classifier is preferred and its spend is recorded;
+    /// once the budget is spent it's skipped so `.free` truly makes zero OpenAI calls. Defaults to
+    /// nil so non-routing callers (folder resolution) are unaffected and never pay.
+    var costGovernor: CostGovernor? = nil
 
     /// Classify `transcript` into an Intent.
     func route(_ transcript: String) async -> Intent {
@@ -48,9 +53,16 @@ struct IntentRouter {
             return intent
         }
 
-        // Only ambiguous commands reach the LLM classifier.
-        if let key = settings.openAIAPIKey, !key.isEmpty,
-           let intent = await classifyWithOpenAI(transcript, key: key) {
+        // Only ambiguous commands reach the LLM classifier. When the budget allows paid calls and
+        // an OpenAI key is set, prefer the FAST gpt-4o classifier (subscription `claude -p` adds a
+        // multi-second subprocess + sonnet latency on the hot path); otherwise use the free
+        // `claude -p` classifier. Fall back across both, then the deterministic keyword heuristic.
+        let key = (settings.openAIAPIKey?.isEmpty == false) ? settings.openAIAPIKey : nil
+        let paidOK = (await costGovernor?.allowsPaidVision) ?? true
+        if paidOK, let key, let intent = await classifyWithOpenAI(transcript, key: key) {
+            return intent
+        }
+        if let intent = await classifyWithClaude(transcript) {
             return intent
         }
         return heuristic(transcript)
@@ -318,6 +330,80 @@ struct IntentRouter {
         return nil
     }
 
+    // MARK: - claude -p classifier (free, preferred)
+
+    /// Classify an ambiguous command with `claude -p` (free via the Claude Code subscription).
+    /// Returns nil (→ OpenAI/heuristic fallback) when claude is unavailable or the output can't be
+    /// parsed. Most commands never reach here — `strongHeuristic` catches the common ones first.
+    private func classifyWithClaude(_ transcript: String) async -> Intent? {
+        let binary = settings.claudeBinary
+        guard !binary.isEmpty, FileManager.default.isExecutableFile(atPath: binary) else { return nil }
+
+        let prompt = """
+        You route a Mac voice assistant's spoken commands. Reply with ONLY a compact one-line JSON \
+        object — no prose, no code fence. Choose exactly one action:
+        {"action":"open_app","arg":"<application name>"}
+        {"action":"open_folder","arg":"<folder name, or empty for home>"}
+        {"action":"web_search","arg":"<search query>","browser":"<chrome|safari|firefox or empty>"}
+        {"action":"open_terminal","arg":"<folder or empty>","claude":<true|false>}
+        {"action":"background_task","arg":"<the task>"}
+        {"action":"calendar","arg":"<event details>"}
+        {"action":"answer"}
+        Use "answer" for questions or conversation. Use "open_terminal" with claude=true only if the \
+        user explicitly wants a Claude / Claude Code session.
+        Command: \(transcript)
+        """
+        let result = await ClaudeProcessRunner.run(
+            binary: binary, args: ["-p", "--model", settings.model], prompt: prompt)
+        guard result.ok else { return nil }
+        return parseClaudeIntent(result.output, originalTranscript: transcript)
+    }
+
+    /// Extract the JSON object from claude's output (tolerant of surrounding prose) and map it.
+    private func parseClaudeIntent(_ output: String, originalTranscript: String) -> Intent? {
+        guard let start = output.firstIndex(of: "{"),
+              let end = output.lastIndex(of: "}"), start < end else { return nil }
+        let json = String(output[start...end])
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let action = (obj["action"] as? String)?.lowercased() else { return nil }
+
+        func str(_ k: String) -> String? {
+            (obj[k] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        switch action {
+        case "open_app":
+            if let app = str("arg"), !app.isEmpty { return .openApp(app) }
+            return .answer
+        case "open_folder":
+            let folder = str("arg")
+            return .openFolder((folder?.isEmpty == false)
+                ? (parseDirectory(from: folder!) ?? folder) : parseDirectory(from: originalTranscript))
+        case "web_search":
+            let q = str("arg") ?? ""
+            let browser = str("browser").flatMap { $0.isEmpty ? nil : $0 }
+            return q.isEmpty ? .answer : .webSearch(query: q, browser: browser)
+        case "open_terminal":
+            let dir = str("arg")
+            let resolved = (dir?.isEmpty == false)
+                ? (parseDirectory(from: dir!) ?? dir) : parseDirectory(from: originalTranscript)
+            let startClaude = (obj["claude"] as? Bool)
+                ?? originalTranscript.lowercased().contains("claude")
+            return .terminal(directory: resolved, startClaude: startClaude)
+        case "background_task":
+            let t = str("arg")
+            return .backgroundAgent((t?.isEmpty == false) ? t! : originalTranscript)
+        case "calendar":
+            let d = str("arg")
+            return .calendar((d?.isEmpty == false) ? d! : originalTranscript)
+        case "answer":
+            return .answer
+        default:
+            return nil
+        }
+    }
+
     // MARK: - OpenAI function-calling classifier
 
     private func classifyWithOpenAI(_ transcript: String, key: String) async -> Intent? {
@@ -387,6 +473,10 @@ struct IntentRouter {
             let (data, response) = try await urlSession.data(for: request)
             guard let http = response as? HTTPURLResponse,
                   (200..<300).contains(http.statusCode) else { return nil }
+            // Meter this paid classifier call against the monthly budget.
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                await costGovernor?.recordVision(usage: obj["usage"] as? [String: Any])
+            }
             return parseToolCall(data, originalTranscript: transcript)
         } catch {
             return nil

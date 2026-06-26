@@ -23,10 +23,11 @@ class TaskKind(str, Enum):
 
 
 class TaskState(str, Enum):
-    """Lifecycle of a single background task. Matches BackgroundTaskState in Swift."""
+    """Lifecycle of a single background task. Matches AgentTaskState in Swift."""
 
     queued = "queued"
     running = "running"
+    paused = "paused"        # waiting on the user's answer (human-in-the-loop interrupt)
     succeeded = "succeeded"
     failed = "failed"
     cancelled = "cancelled"
@@ -51,3 +52,10 @@ class TaskEvent(BaseModel):
     state: TaskState
     summary: Optional[str] = None   # spoken one-liner once finished
     detail: Optional[str] = None    # original task text (for matching / display)
+    question: Optional[str] = None  # set with state=paused: what the agent is asking the user
+
+
+class ResumeRequest(BaseModel):
+    """Body of POST /tasks/{id}/resume — the user's answer to a paused task's question."""
+
+    answer: str = Field(..., description="The user's spoken answer to the agent's question.")

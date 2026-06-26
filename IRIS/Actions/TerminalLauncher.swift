@@ -17,7 +17,11 @@ import Foundation
 enum TerminalLauncher {
 
     /// Open Terminal in `directory`, optionally starting a `claude` session. Speakable result.
-    static func open(in directory: String, claudeBinary: String, startClaude: Bool) async -> String {
+    /// When `skipPermissions` is true, claude starts with `--dangerously-skip-permissions` (the
+    /// "trust this folder?" prompt is skipped); set it false so that prompt appears and IRIS can
+    /// learn to handle it reactively (ScreenRuleEngine).
+    static func open(in directory: String, claudeBinary: String,
+                     startClaude: Bool, skipPermissions: Bool = true) async -> String {
         let expanded = (directory as NSString).expandingTildeInPath
         var isDir: ObjCBool = false
         let exists = FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir)
@@ -26,10 +30,11 @@ enum TerminalLauncher {
             : FileManager.default.homeDirectoryForCurrentUser.path
 
         let claude = claudeBinary.isEmpty ? "claude" : claudeBinary
-        // For claude: --dangerously-skip-permissions skips the "trust this folder?" prompt and
-        // runs with full tool access so IRIS-started sessions are ready to act immediately.
+        let claudeCmd = skipPermissions
+            ? "\(shQuote(claude)) --dangerously-skip-permissions"
+            : shQuote(claude)
         let shellCmd = startClaude
-            ? "cd \(shQuote(targetDir)) && \(shQuote(claude)) --dangerously-skip-permissions"
+            ? "cd \(shQuote(targetDir)) && \(claudeCmd)"
             : "cd \(shQuote(targetDir))"
         let appleScript = """
         tell application "Terminal"

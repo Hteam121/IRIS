@@ -48,24 +48,33 @@ public final class IRISBrain: IRISResponder {
     /// Answer a foreground question. Routing happens upstream in AppDelegate; by the time we're
     /// here the command is a plain question to answer (optionally using the screenshot).
     public func ask(transcript: String, screenshotPath: String?) async -> String {
-        await ask(transcript: transcript, screenshotPath: screenshotPath, history: [])
+        await ask(transcript: transcript, screenshotPath: screenshotPath, history: [], memory: "")
     }
 
     /// History-aware answer. `history` is recent (role, content) turns so IRIS holds a
     /// conversation (e.g. answering a follow-up after it asked a question). role ∈ user/assistant.
+    /// `memory` is a precomputed block of learned facts/preferences (from `MemoryStore`) injected
+    /// into the system framing so IRIS applies what it has learned. Computed on the MainActor by
+    /// the caller so there are no actor hops in here.
     public func ask(transcript: String, screenshotPath: String?,
-                    history: [[String: String]]) async -> String {
+                    history: [[String: String]], memory: String = "") async -> String {
         if let key = settings.anthropicAPIKey, !key.isEmpty {
             return await askAPI(transcript: transcript, screenshotPath: screenshotPath,
-                                apiKey: key, history: history)
+                                apiKey: key, history: history, memory: memory)
         }
-        return await askCLI(transcript: transcript, screenshotPath: screenshotPath, history: history)
+        return await askCLI(transcript: transcript, screenshotPath: screenshotPath,
+                            history: history, memory: memory)
+    }
+
+    /// Glue the optional learned-memory block onto a base system/prompt string.
+    private static func withMemory(_ base: String, _ memory: String) -> String {
+        memory.isEmpty ? base : base + "\n\n" + memory
     }
 
     // MARK: - Anthropic Messages API (true vision)
 
     private func askAPI(transcript: String, screenshotPath: String?, apiKey: String,
-                        history: [[String: String]]) async -> String {
+                        history: [[String: String]], memory: String) async -> String {
         guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
             return Self.genericError
         }
@@ -94,7 +103,7 @@ public final class IRISBrain: IRISResponder {
         let body: [String: Any] = [
             "model": settings.model,
             "max_tokens": Self.maxTokens,
-            "system": Self.systemPrompt + "\n\n" + Self.nowContext(),
+            "system": Self.withMemory(Self.systemPrompt + "\n\n" + Self.nowContext(), memory),
             "messages": messages,
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
@@ -131,13 +140,13 @@ public final class IRISBrain: IRISResponder {
     // MARK: - claude CLI (subscription, best-effort vision via file path)
 
     private func askCLI(transcript: String, screenshotPath: String?,
-                        history: [[String: String]]) async -> String {
+                        history: [[String: String]], memory: String) async -> String {
         let binary = settings.claudeBinary
         guard !binary.isEmpty, FileManager.default.isExecutableFile(atPath: binary) else {
             return "I can't reach Claude right now — the claude command wasn't found and no API key is set."
         }
 
-        var prompt = Self.systemPrompt + "\n\n" + Self.nowContext() + "\n\n"
+        var prompt = Self.withMemory(Self.systemPrompt + "\n\n" + Self.nowContext(), memory) + "\n\n"
         if !history.isEmpty {
             prompt += "Conversation so far:\n"
             for turn in history {
@@ -168,6 +177,77 @@ public final class IRISBrain: IRISResponder {
             return result.output
         }
         return result.output.isEmpty ? Self.cliError : result.output
+    }
+
+    // MARK: - Inferred memory extraction (foreground "learns from itself" backstop)
+
+    /// Pull DURABLE user preferences / standing instructions / stable facts out of one exchange.
+    /// Returns short third-person statements to store (or [] when nothing is worth keeping). This
+    /// is the non-realtime path; in realtime the model saves memories itself via the `remember`
+    /// tool. Text-only and deliberately tiny — the caller gates it so it doesn't run every turn.
+    public func extractMemories(userTurn: String, assistantTurn: String) async -> [String] {
+        let task = """
+        You maintain a long-term memory for a voice assistant. From the exchange below, extract \
+        ONLY durable user preferences, standing instructions, or stable facts worth remembering \
+        across sessions — NOT one-off requests, small talk, or anything time-bound. Return a JSON \
+        array of short third-person strings, e.g. ["User prefers Chrome for web searches"]. If \
+        nothing is worth keeping, return [].
+
+        User: \(userTurn)
+        IRIS: \(assistantTurn)
+        """
+        let system = "You output ONLY a JSON array of strings, nothing else."
+        let raw: String
+        if let key = settings.anthropicAPIKey, !key.isEmpty {
+            raw = await rawAPICompletion(system: system, user: task, apiKey: key)
+        } else {
+            raw = await rawCLICompletion(prompt: system + "\n\n" + task)
+        }
+        return Self.parseJSONStringArray(raw)
+    }
+
+    /// Minimal Messages API call (no vision, no history, no spoken-style framing).
+    private func rawAPICompletion(system: String, user: String, apiKey: String) async -> String {
+        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else { return "" }
+        let body: [String: Any] = [
+            "model": settings.model,
+            "max_tokens": 256,
+            "system": system,
+            "messages": [["role": "user", "content": user]],
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return "" }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = bodyData
+        guard let (data, response) = try? await urlSession.data(for: request),
+              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let blocks = obj["content"] as? [[String: Any]] else { return "" }
+        return blocks.compactMap { $0["text"] as? String }.joined()
+    }
+
+    /// Minimal CLI completion (subscription path) for memory extraction.
+    private func rawCLICompletion(prompt: String) async -> String {
+        let binary = settings.claudeBinary
+        guard !binary.isEmpty, FileManager.default.isExecutableFile(atPath: binary) else { return "" }
+        let result = await ClaudeProcessRunner.run(
+            binary: binary, args: ["-p", "--model", settings.model], prompt: prompt)
+        return result.ok ? result.output : ""
+    }
+
+    /// Tolerantly parse a JSON array of strings out of a model reply (handles stray prose/fences).
+    static func parseJSONStringArray(_ raw: String) -> [String] {
+        guard let start = raw.firstIndex(of: "["), let end = raw.lastIndex(of: "]"),
+              start < end else { return [] }
+        let slice = String(raw[start...end])
+        guard let data = slice.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [String] else { return [] }
+        return arr
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 
     // MARK: - Canned replies

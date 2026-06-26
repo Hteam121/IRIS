@@ -68,6 +68,7 @@ final class RealtimeAudio: @unchecked Sendable {
                 IRISLog.log("realtime audio: AEC start failed (\(error.localizedDescription)) — using plain engine")
                 rebuild()
                 try startEngine(voiceProcessing: false)
+                scheduleNoAECInputWatchdog()
             }
             // Watchdog: AEC can start but deliver no/low input — fall back to plain engine.
             DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -75,9 +76,35 @@ final class RealtimeAudio: @unchecked Sendable {
                 IRISLog.log("realtime audio: AEC starved input — falling back to no-AEC half-duplex")
                 self.rebuild()
                 try? self.startEngine(voiceProcessing: false)
+                self.scheduleNoAECInputWatchdog()
             }
         } else {
             try startEngine(voiceProcessing: false)
+            scheduleNoAECInputWatchdog()
+        }
+    }
+
+    /// No-AEC recovery. The engine can report "started" yet the input tap never delivers a buffer —
+    /// an intermittent macOS failure when we stop the wake-word engine and start this one on the
+    /// same input device before it's ready (the same family as the -10877 errors). If no mic data
+    /// has arrived shortly after start, rebuild the input node and retry a few times so the session
+    /// doesn't sit deaf until the idle timeout.
+    private func scheduleNoAECInputWatchdog(attempt: Int = 0) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.isRunning, !self.aecActive else { return }
+            if self.bufferCountValue > 0 { return }   // mic is delivering — healthy
+            guard attempt < 4 else {
+                IRISLog.log("realtime audio: mic delivered no buffers after \(attempt + 1) tries — giving up")
+                return
+            }
+            IRISLog.log("realtime audio: no mic buffers yet — rebuilding input (retry \(attempt + 1))")
+            self.rebuild()
+            do {
+                try self.startEngine(voiceProcessing: false)
+                self.scheduleNoAECInputWatchdog(attempt: attempt + 1)
+            } catch {
+                IRISLog.log("realtime audio: input rebuild failed: \(error.localizedDescription)")
+            }
         }
     }
 

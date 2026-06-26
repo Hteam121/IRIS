@@ -143,21 +143,23 @@ struct AgentPillRow: View {
 
     private var color: Color {
         switch task.state {
-        case .queued:    return .gray
-        case .running:   return .purple
-        case .succeeded: return .green
-        case .failed:    return .red
-        case .cancelled: return .gray
+        case .queued:         return .gray
+        case .running:        return .purple
+        case .waitingForUser: return .orange
+        case .succeeded:      return .green
+        case .failed:         return .red
+        case .cancelled:      return .gray
         }
     }
 
     private var stateLabel: String {
         switch task.state {
-        case .queued:    return "Queued…"
-        case .running:   return "Working…"
-        case .succeeded: return "Done"
-        case .failed:    return "Failed"
-        case .cancelled: return "Cancelled"
+        case .queued:         return "Queued…"
+        case .running:        return "Working…"
+        case .waitingForUser: return "Waiting on you…"
+        case .succeeded:      return "Done"
+        case .failed:         return "Failed"
+        case .cancelled:      return "Cancelled"
         }
     }
 

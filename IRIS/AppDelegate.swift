@@ -22,6 +22,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let appState = AppState()
     private var settings = IRISSettings.load()
 
+    // The persistent self-learning "brain": loaded at launch, injected into every prompt path,
+    // written to when IRIS is taught something (explicitly or by inference). See Memory.swift.
+    private let memory = MemoryStore()
+
+    // Meters OpenAI spend against the monthly budget and decides, per interaction, whether the
+    // paid realtime core may run or IRIS should fall back to the free `claude -p` pipeline /
+    // on-device voice. See CostGovernor.swift + docs/algorithms.md → Cost Governor.
+    private lazy var costGovernor = CostGovernor(
+        budgetUSD: settings.monthlyBudgetUSD, realtimeModel: settings.realtimeModel)
+
     // Components (Phase 1 lanes), retained for the app's lifetime.
     private var panel: FloatingPanel?
     private var statusBarItem: StatusBarItem?
@@ -68,6 +78,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastTurnAt = Date.distantPast
     private var expectingFollowUp = false
 
+    // Steerable agents: a background task that paused to ask the user something. While set, IRIS
+    // keeps listening and routes the next spoken answer to RESUME that task (via the realtime
+    // `answer_task` tool, or the classic follow-up path) instead of normal command routing.
+    private var pendingQuestion: (id: String, question: String)?
+
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -76,6 +91,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // The brain (hybrid CLI/API routing + intent routing).
         brain = IRISBrain(settings: settings)
+
+        // Load the persistent learned memory ("the brain's brain").
+        if settings.memoryEnabled { memory.load() }
 
         // Floating orb overlay, shown near the cursor and tracking it.
         let panel = FloatingPanel(appState: appState)
@@ -100,6 +118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.speaker?.enqueue(text)
             }
         }
+        // Human-in-the-loop: a paused task asks the user something; when it resumes, clear state.
+        agentManager.onQuestion = { [weak self] task in self?.handleAgentQuestion(task) }
+        agentManager.onQuestionResolved = { [weak self] _ in self?.clearPendingQuestion() }
         agentManager.start()
 
         // Menu-bar 👁: toggle the overlay / open Settings / quit.
@@ -133,12 +154,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Jarvis/Cluely core, wake-gated: a local "hey iris" listener starts the realtime
             // conversation; it auto-sleeps after `idlePauseSeconds` of no speech (saves cost).
             let rt = RealtimeSession(settings: settings, appState: appState,
-                                     agentManager: agentManager, screenCapture: screenCapture)
+                                     agentManager: agentManager, screenCapture: screenCapture,
+                                     memory: memory, costGovernor: costGovernor)
             rt.onIdleTimeout = { [weak self] in self?.goToSleep() }
+            rt.onBudgetExhausted = { [weak self] in self?.handleBudgetExhausted() }
             self.realtimeSession = rt
 
             let wake = WakeWordDetector(settings: settings, appState: appState)
             wake.onWakeDetected = { [weak self] in self?.wakeUp() }
+            // Budget-fallback path: in the saver/free tiers wakeUp() does NOT open the paid
+            // realtime stream — it leaves the detector running so the command it then captures is
+            // answered by the free classic `claude -p` pipeline. (In premium mode wakeUp() stops
+            // the detector first, so these never fire.)
+            wake.onWakeWordDetected = { [weak self] command in self?.handleCommand(command) }
+            wake.onBargeIn = { [weak self] in self?.handleVoiceBargeIn() }
             self.wakeWord = wake
 
             WakeWordDetector.requestAuthorization { [weak self] granted in
@@ -172,14 +201,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// "Hey IRIS" heard while sleeping → start the realtime conversation (stop the wake listener).
+    /// "Hey IRIS" heard while sleeping. In the .premium budget tier this starts the paid realtime
+    /// conversation (and stops the wake listener); in .saver/.free it does NOT — it leaves the
+    /// detector running so the captured command is answered by the free classic `claude -p`
+    /// pipeline, keeping spend under the monthly cap.
     private func wakeUp() {
         guard settings.realtimeEnabled, let rt = realtimeSession, !realtimeActive else { return }
+        let tier = costGovernor.tier()
+        guard tier == .premium else {
+            IRISLog.log("wake phrase → budget tier \(tier.rawValue): using free claude -p pipeline (realtime suppressed)")
+            return   // detector stays live → delivers the command to handleCommand (classic)
+        }
         realtimeActive = true
         IRISLog.log("wake phrase → starting realtime conversation")
         wakeWord?.stop()
         appState.status = .listening
         rt.start()
+        primeRealtimeOnWake(rt)
+    }
+
+    /// On re-wake, surface in-flight context so "Hey IRIS" doesn't start blank: re-ask a task's
+    /// pending question, or note a still-running background task. (Queued in the session and
+    /// flushed once it's ready.)
+    private func primeRealtimeOnWake(_ rt: RealtimeSession) {
+        if let pq = pendingQuestion {
+            rt.awaitingAnswer = true
+            rt.primeContext(
+                "A background task is waiting on the user's answer to this question: \"\(pq.question)\". "
+                + "Ask the user that now, and when they answer call answer_task with their reply.",
+                respond: true)
+            return
+        }
+        let active = appState.backgroundTasks.filter { !$0.state.isFinished }
+        if let t = active.first {
+            rt.primeContext(
+                "Context: a background task \"\(t.title)\" is still running. If the user asks about it, "
+                + "tell them it's still in progress.", respond: false)
+        }
     }
 
     /// No speech for `idlePauseSeconds` → pause the realtime stream and return to wake listening.
@@ -192,6 +250,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.transcript = ""
         appState.responseText = ""
         wakeWord?.start()
+    }
+
+    /// A turn's spend pushed the monthly budget past the cap mid-conversation: end the paid realtime
+    /// stream now and tell the user. The next "hey iris" re-checks the tier in `wakeUp()` and falls
+    /// back to the free `claude -p` pipeline, so spend can't keep climbing in one long sitting.
+    private func handleBudgetExhausted() {
+        guard realtimeActive else { return }
+        IRISLog.log("budget cap reached mid-conversation → ending realtime, switching to free pipeline")
+        speaker?.enqueue("That's the monthly budget reached, so I'll switch to the free mode now.")
+        goToSleep()
     }
 
     /// Surface the Screen Recording prompt at launch (for screen vision). macOS can't fully grant
@@ -208,6 +276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wakeWord?.stop()
         realtimeSession?.stop()
         speaker?.stop()
+        costGovernor.flush()   // persist any debounced spend before exit
         agentManager?.shutdown()
         panel?.hide()
         if let m = globalHotkeyMonitor { NSEvent.removeMonitor(m) }
@@ -223,7 +292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Build a Speaker from the current settings, wiring the finished→idle callback.
     private func makeSpeaker() -> Speaker {
-        let speaker = Speaker(settings: settings, appState: appState)
+        let speaker = Speaker(settings: settings, appState: appState, costGovernor: costGovernor)
         speaker.onFinished = { [weak self] in self?.speechFinished() }
         return speaker
     }
@@ -250,10 +319,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Settings window + live apply
 
     private func showSettings() {
-        settingsWindowController.show(settings: settings) { [weak self] anthropic, openAI, model in
+        settingsWindowController.show(settings: settings) { [weak self] anthropic, openAI, model, budget in
             guard let self else { return }
             let new = self.settings.withUpdatedKeys(
-                anthropic: anthropic, openAI: openAI, model: model)
+                anthropic: anthropic, openAI: openAI, model: model, budget: budget)
             do {
                 try new.save()
             } catch {
@@ -291,6 +360,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             speaker = newSpeaker
             agentManager?.setSpeaker(newSpeaker)   // keep completion announcements wired
         }
+        // Keep the cost governor in sync with the new budget + realtime model.
+        costGovernor.applyBudget(new.monthlyBudgetUSD)
+        costGovernor.applyRealtimeModel(new.realtimeModel)
         // Apply sidecar-affecting changes (keys/model/port/python) — may restart the sidecar.
         agentManager?.applySettings(new)
         realtimeSession?.applySettings(new)
@@ -363,6 +435,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastCommandAt = Date()
         expectingFollowUp = false   // recomputed per command (set only when IRIS asks something)
 
+        // If a background task is waiting on the user, this utterance is its answer — route it to
+        // resume the task instead of normal command handling. (Realtime mode answers via the
+        // `answer_task` tool; this is the classic / free-tier path.)
+        if let pq = pendingQuestion {
+            clearPendingQuestion()
+            agentManager.resume(pq.id, answer: command)
+            finishForeground("Okay, passing that along.")
+            return
+        }
+
+        // Explicit teaching ("remember…", "from now on…", "always…") — store it and confirm,
+        // skipping normal routing. Backstop for the non-realtime path (realtime uses the
+        // `remember` tool instead).
+        if handleTeaching(command) { return }
+
         // Otherwise consecutive commands run CONCURRENTLY — a new question never cancels an
         // in-flight one (both get answered). Background agents in `agentManager` are untouched.
         appState.status = .thinking
@@ -388,7 +475,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            let router = IntentRouter(settings: settings, urlSession: .shared)
+            let router = IntentRouter(settings: settings, urlSession: .shared,
+                                      costGovernor: costGovernor)
             let intent = await router.route(command)
             if Task.isCancelled { return }
 
@@ -407,10 +495,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     screenshotPath = await screenCapture.capture()
                     if Task.isCancelled { return }
                 }
+                let memoryBlock = settings.memoryEnabled ? memory.promptBlock() : ""
                 let reply = await brain?.ask(transcript: command, screenshotPath: screenshotPath,
-                                             history: history) ?? IRISBrain.genericError
+                                             history: history, memory: memoryBlock) ?? IRISBrain.genericError
                 if Task.isCancelled { return }
                 recordTurn(user: command, assistant: reply)
+                maybeLearn(from: command, reply: reply)   // inferred ("learns from itself")
                 // If IRIS asked something, auto-listen for the reply (no wake word) afterward.
                 expectingFollowUp = Self.looksLikeQuestion(reply)
                 finishForeground(reply)
@@ -439,8 +529,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 lastTerminalLaunchAt = Date()
                 let target = dir ?? settings.defaultAgentDirectory
-                let reply = await TerminalLauncher.open(
-                    in: target, claudeBinary: settings.claudeBinary, startClaude: startClaude)
+                // Open the terminal and, when a Claude session starts, apply any learned screen rule
+                // (e.g. the "trust this folder?" prompt) and fold its spoken note into the reply.
+                let reply = await ScreenRuleEngine.openTerminalApplyingRules(
+                    in: target, startClaude: startClaude, settings: settings,
+                    memory: memory, screenCapture: screenCapture, costGovernor: costGovernor)
                 if Task.isCancelled { return }
                 // If the user named a folder we couldn't resolve, say so instead of pretending.
                 if dir == nil, let named = router.spokenDirectoryName(command) {
@@ -532,6 +625,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reply.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
     }
 
+    // MARK: - Steerable agents (deliver a paused task's question, route the answer)
+
+    /// A background task paused to ask the user something. Deliver it by voice and arrange to
+    /// capture the answer: in realtime via the `answer_task` tool (primed here), or — when asleep /
+    /// in the free tier — by speaking it and listening for the next utterance (the follow-up path).
+    private func handleAgentQuestion(_ task: AgentTask) {
+        let q = task.question ?? "I need a decision from you to continue."
+        pendingQuestion = (task.id, q)
+        if realtimeActive, let rt = realtimeSession, rt.isActive {
+            rt.awaitingAnswer = true
+            rt.primeContext(
+                "A background task is asking the user: \"\(q)\". Ask the user this now, and when "
+                + "they answer call answer_task with their reply.", respond: true)
+        } else {
+            appState.responseText = q
+            speaker?.enqueue(q)
+            expectingFollowUp = true   // speechFinished → captureFollowUp() → handleCommand answer
+        }
+    }
+
+    /// Clear the pending-question state once a task is answered or cancelled.
+    private func clearPendingQuestion() {
+        pendingQuestion = nil
+        realtimeSession?.awaitingAnswer = false
+    }
+
     /// Recent conversation turns to give the model context; cleared when stale (>2 min) so an
     /// unrelated later command doesn't carry old baggage.
     private func historyForLLM() -> [[String: String]] {
@@ -544,5 +663,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         conversation.append(["role": "assistant", "content": assistant])
         if conversation.count > 16 { conversation.removeFirst(conversation.count - 16) }
         lastTurnAt = Date()
+    }
+
+    // MARK: - Learning (foreground backstop; realtime uses the `remember` tool)
+
+    /// Handle a "teach IRIS something" instruction. A pure fact/preference ("remember that I like
+    /// Chrome") is stored and confirmed, skipping normal routing. But a standing instruction that
+    /// also names an action ("always open Chrome", "from now on start my email") is remembered AND
+    /// still carried out — it must not be silently swallowed into an inert note. Returns true when
+    /// handled (stored, and possibly dispatched).
+    private func handleTeaching(_ command: String) -> Bool {
+        guard settings.memoryEnabled, let (prefix, remainder) = Self.splitTeaching(command) else {
+            return false
+        }
+        let fact = Self.normalizeTaught(remainder, addAlways: prefix == "always ")
+        if isActionableInstruction(remainder) {
+            memory.add(text: fact, kind: .preference, source: .explicit)
+            handleCommand(remainder)   // remember the rule, but also act on the command now
+            return true
+        }
+        let isNew = memory.add(text: fact, kind: .preference, source: .explicit)
+        finishForeground(isNew ? "Got it — I'll remember that." : "I already had that noted.")
+        return true
+    }
+
+    /// Split a teaching command into (matched cue prefix, raw remainder) when it starts with a
+    /// teaching cue; nil otherwise (or when nothing meaningful follows the cue).
+    static func splitTeaching(_ command: String) -> (prefix: String, remainder: String)? {
+        let t = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = t.lowercased()
+        let prefixes = [
+            "please remember that ", "please remember ", "remember that ", "remember ",
+            "note that ", "from now on, ", "from now on ", "don't ask me again, ",
+            "don't ask me again ", "always ",
+        ]
+        for p in prefixes where lower.hasPrefix(p) {
+            let idx = t.index(t.startIndex, offsetBy: p.count)
+            let rest = String(t[idx...]).trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;-"))
+            if !rest.isEmpty { return (p, rest) }
+        }
+        return nil
+    }
+
+    /// Back-compat: the normalized stored fact for a teaching command, or nil if it isn't one.
+    static func extractTaughtFact(_ command: String) -> String? {
+        guard let (p, rest) = splitTeaching(command) else { return nil }
+        return normalizeTaught(rest, addAlways: p == "always ")
+    }
+
+    /// Whether a taught remainder is really an imperative command (so it should be ACTED ON, not
+    /// just stored): a leading action verb, or a remainder the router maps to a concrete intent.
+    private func isActionableInstruction(_ remainder: String) -> Bool {
+        let lower = remainder.lowercased()
+        let verbs = ["open ", "launch ", "start ", "run ", "play ", "close ", "search ", "google ",
+                     "look up ", "show ", "go to ", "schedule ", "set ", "create ", "find ",
+                     "type ", "press ", "click ", "switch to "]
+        if verbs.contains(where: { lower.hasPrefix($0) }) { return true }
+        let router = IntentRouter(settings: settings, urlSession: .shared)
+        if let intent = router.strongHeuristic(remainder), intent != .answer { return true }
+        return false
+    }
+
+    /// Rewrite leading first-person to "User …" so a stored fact isn't ambiguous in the prompt.
+    private static func normalizeTaught(_ s: String, addAlways: Bool) -> String {
+        var f = s
+        let lower = f.lowercased()
+        if lower.hasPrefix("i'm ") { f = "User is " + String(f.dropFirst(4)) }
+        else if lower.hasPrefix("i am ") { f = "User is " + String(f.dropFirst(5)) }
+        else if lower.hasPrefix("my ") { f = "User's " + String(f.dropFirst(3)) }
+        else if lower.hasPrefix("i ") { f = "User " + String(f.dropFirst(2)) }
+        return addAlways ? "Always " + f : f
+    }
+
+    /// "Learns from itself": when a turn carries a preference/correction cue, ask the brain to
+    /// extract durable memories and store them (deduped), announcing if anything new was saved.
+    /// Gated so it never runs on ordinary turns. No-op in realtime (that path self-saves).
+    private func maybeLearn(from userTurn: String, reply: String) {
+        guard settings.memoryEnabled, let brain, Self.hasLearningCue(userTurn) else { return }
+        Task { @MainActor in
+            let candidates = await brain.extractMemories(userTurn: userTurn, assistantTurn: reply)
+            let added = candidates.filter {
+                memory.add(text: $0, kind: .preference, source: .inferred)
+            }
+            if !added.isEmpty { speaker?.enqueue("Noted — I'll remember that.") }
+        }
+    }
+
+    private static func hasLearningCue(_ s: String) -> Bool {
+        let l = s.lowercased()
+        // Only cues that genuinely signal a durable preference/identity/standing instruction. We
+        // deliberately drop broad words ("actually", "instead of", bare "stop "/"don't ") that fire
+        // on ordinary commands ("stop the timer", "don't open that") and caused a spurious
+        // extractMemories round-trip + out-of-place "Noted — I'll remember that".
+        let cues = ["i prefer", "i like", "i always", "i usually", "i hate", "i don't like",
+                    "i don't want", "from now on", "my name is", "call me", "i want you to",
+                    "please don't", "i'd prefer", "i would prefer"]
+        return cues.contains { l.contains($0) }
     }
 }

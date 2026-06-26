@@ -15,12 +15,16 @@ import Foundation
 
 /// Lifecycle of one background task. Matches the sidecar's `TaskState`.
 public enum AgentTaskState: String, Sendable, Codable {
-    case queued, running, succeeded, failed, cancelled
+    case queued, running
+    /// Paused, waiting on the user's answer to a question the agent asked (human-in-the-loop).
+    /// Raw value `paused` matches the sidecar's `TaskState.paused`.
+    case waitingForUser = "paused"
+    case succeeded, failed, cancelled
 
     /// True once the task has reached a terminal state.
     public var isFinished: Bool {
         switch self {
-        case .queued, .running: return false
+        case .queued, .running, .waitingForUser: return false
         case .succeeded, .failed, .cancelled: return true
         }
     }
@@ -43,6 +47,8 @@ public struct AgentTask: Identifiable, Sendable, Equatable {
     public var finishedAt: Date?
     /// Spoken one-liner produced when the task finishes.
     public var resultSummary: String?
+    /// When `state == .waitingForUser`, the question the agent is asking the user.
+    public var question: String?
 
     public init(
         id: String,
@@ -52,7 +58,8 @@ public struct AgentTask: Identifiable, Sendable, Equatable {
         state: AgentTaskState,
         startedAt: Date = Date(),
         finishedAt: Date? = nil,
-        resultSummary: String? = nil
+        resultSummary: String? = nil,
+        question: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -62,5 +69,6 @@ public struct AgentTask: Identifiable, Sendable, Equatable {
         self.startedAt = startedAt
         self.finishedAt = finishedAt
         self.resultSummary = resultSummary
+        self.question = question
     }
 }

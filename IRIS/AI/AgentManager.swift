@@ -69,6 +69,13 @@ final class AgentManager {
     /// conversation is active (so it doesn't overlap), or the TTS Speaker otherwise.
     var onAnnouncement: ((String) -> Void)?
 
+    /// Fires when a task pauses to ask the user something (human-in-the-loop). AppDelegate delivers
+    /// the question by voice and routes the user's next answer back via `answerWaiting`/`resume`.
+    var onQuestion: ((AgentTask) -> Void)?
+    /// Fires when a previously-paused task leaves the waiting state (answered or cancelled), so
+    /// AppDelegate can clear its pending-question UI/listening state.
+    var onQuestionResolved: ((String) -> Void)?
+
     private func announce(_ text: String) {
         guard !text.isEmpty else { return }
         if let onAnnouncement { onAnnouncement(text) } else { speaker?.enqueue(text) }
@@ -111,6 +118,44 @@ final class AgentManager {
         Task { [weak self] in await self?.client.cancel(id) }
     }
 
+    // MARK: - Steering (human-in-the-loop)
+
+    /// Resume a specific paused task with the user's answer.
+    func resume(_ id: String, answer: String) {
+        Task { [weak self] in await self?.client.resume(id, answer: answer) }
+    }
+
+    /// Resume whichever task is currently waiting on the user (there's normally just one).
+    /// Returns a short spoken confirmation for the caller (e.g. the realtime `answer_task` tool).
+    @discardableResult
+    func answerWaiting(_ answer: String) -> String {
+        let waiting = (appState?.backgroundTasks ?? []).filter { $0.state == .waitingForUser }
+        guard let task = waiting.first else {
+            return "There's no task waiting on an answer right now."
+        }
+        resume(task.id, answer: answer)
+        return "Okay, passing that along."
+    }
+
+    /// Redirect the running task with a new instruction. Pragmatic implementation: cancel it and
+    /// relaunch with the original detail plus the user's addition (no mid-run graph surgery).
+    @discardableResult
+    func redirect(_ instruction: String) -> String {
+        let active = (appState?.backgroundTasks ?? []).filter { !$0.state.isFinished }
+        guard let task = active.first else { return "There's no running task to redirect." }
+        cancel(task.id)
+        let base = task.detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newDetail = base.isEmpty ? instruction : "\(base); the user adds: \(instruction)"
+        launch(kind: task.kind, detail: newDetail, title: task.title,
+               cwd: settings.defaultAgentDirectory)
+        return "Okay, I'll take another run at that."
+    }
+
+    /// Whether a task is currently waiting on the user (used to route a spoken answer to `resume`).
+    var hasWaitingTask: Bool {
+        (appState?.backgroundTasks ?? []).contains { $0.state == .waitingForUser }
+    }
+
     /// Cancel a running task referenced by a spoken phrase ("cancel the deal search").
     /// Matches on title/detail; if exactly one task is active, cancels it. Returns the
     /// cancelled task's title, or nil if nothing matched.
@@ -136,7 +181,9 @@ final class AgentManager {
     private func apply(_ event: SidecarTaskEvent) {
         guard let appState else { return }
         let finished = event.state.isFinished
+        let oldState = appState.backgroundTasks.first(where: { $0.id == event.id })?.state
 
+        let updated: AgentTask
         if let idx = appState.backgroundTasks.firstIndex(where: { $0.id == event.id }) {
             var t = appState.backgroundTasks[idx]
             t.kind = event.kind
@@ -144,14 +191,25 @@ final class AgentManager {
             if let d = event.detail { t.detail = d }
             t.state = event.state
             if let s = event.summary { t.resultSummary = s }
+            t.question = event.question
             if finished && t.finishedAt == nil { t.finishedAt = Date() }
             appState.backgroundTasks[idx] = t
+            updated = t
         } else {
-            appState.backgroundTasks.append(AgentTask(
+            let t = AgentTask(
                 id: event.id, kind: event.kind, title: event.title,
                 detail: event.detail ?? "", state: event.state,
                 finishedAt: finished ? Date() : nil,
-                resultSummary: event.summary))
+                resultSummary: event.summary, question: event.question)
+            appState.backgroundTasks.append(t)
+            updated = t
+        }
+
+        // Human-in-the-loop transitions: ask the user, or clear a resolved question.
+        if event.state == .waitingForUser {
+            onQuestion?(updated)
+        } else if oldState == .waitingForUser {
+            onQuestionResolved?(event.id)
         }
 
         if finished {

@@ -26,6 +26,10 @@ final class Speaker: NSObject {
     private var audioPlayer: AVAudioPlayer?           // OpenAI neural TTS playback
     private var ttsTask: Task<Void, Never>?           // in-flight OpenAI synthesis fetch
 
+    /// Budget meter. Gates neural TTS off in the `.free` tier (→ on-device) and records the
+    /// per-synthesis character cost. Nil ⇒ unmetered (always allowed).
+    private weak var costGovernor: CostGovernor?
+
     /// Called on the main actor when speech finishes or is cancelled.
     var onFinished: (() -> Void)?
 
@@ -47,15 +51,20 @@ final class Speaker: NSObject {
     /// The best available system voice (fallback path), cached after first lookup.
     private lazy var preferredVoice: AVSpeechSynthesisVoice? = resolveVoice()
 
-    init(settings: Settings, appState: AppState) {
+    init(settings: Settings, appState: AppState, costGovernor: CostGovernor? = nil) {
         self.settings = settings
         self.appState = appState
+        self.costGovernor = costGovernor
         super.init()
         synthesizer.delegate = self
     }
 
+    /// Use OpenAI neural TTS only when enabled, keyed, AND the budget tier still allows it
+    /// (the `.free` tier forces the offline voice so a spent budget can't be exceeded).
     private var useOpenAI: Bool {
-        settings.openAITTSEnabled && !(settings.openAIAPIKey ?? "").isEmpty
+        settings.openAITTSEnabled
+            && !(settings.openAIAPIKey ?? "").isEmpty
+            && (costGovernor?.allowsNeuralTTS ?? true)
     }
 
     /// Whether speech is currently in progress or being prepared.
@@ -110,7 +119,10 @@ final class Speaker: NSObject {
                 guard let self else { return }
                 let data = await OpenAITTS.synthesize(text: text, settings: self.settings)
                 if gen != self.generation { return }     // superseded or stopped while fetching
-                if let data, self.play(data) { return }
+                if let data, self.play(data) {
+                    self.costGovernor?.recordTTS(characters: text.count)
+                    return
+                }
                 self.speakSystem(text)                    // fall back on failure
             }
         } else {

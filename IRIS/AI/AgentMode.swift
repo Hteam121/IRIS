@@ -30,8 +30,10 @@ public final class AgentMode: Sendable {
         self.settings = settings
     }
 
-    /// Run the agentic task contained in `transcript` and return a speakable summary.
-    public func run(transcript: String) async -> String {
+    /// Run the agentic task contained in `transcript` and return a speakable summary. `memory` is a
+    /// precomputed block of learned facts/preferences (from `MemoryStore`) so the agent applies
+    /// what IRIS has learned; empty when memory is off or there's nothing to recall.
+    public func run(transcript: String, memory: String = "") async -> String {
         let task = Self.extractTask(from: transcript)
         guard !task.isEmpty else {
             return "What would you like the agent to do?"
@@ -43,7 +45,7 @@ public final class AgentMode: Sendable {
         }
 
         let prompt = """
-        \(Self.agentSystemPrompt)
+        \(Self.agentSystemPrompt)\(memory.isEmpty ? "" : "\n\n" + memory)
 
         Task: \(task)
         """

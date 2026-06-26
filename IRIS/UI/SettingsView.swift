@@ -18,16 +18,20 @@ struct SettingsView: View {
     @State private var anthropicKey: String
     @State private var openAIKey: String
     @State private var model: String
+    @State private var budget: String
     @State private var savedNote = false
 
-    /// Invoked with the entered (anthropic, openAI, model) values when the user taps Save.
-    let onSave: (_ anthropic: String, _ openAI: String, _ model: String) -> Void
+    /// Invoked with the entered (anthropic, openAI, model, budget) values when the user taps Save.
+    let onSave: (_ anthropic: String, _ openAI: String, _ model: String, _ budget: String) -> Void
 
     init(settings: IRISSettings,
-         onSave: @escaping (String, String, String) -> Void) {
+         onSave: @escaping (String, String, String, String) -> Void) {
         _anthropicKey = State(initialValue: settings.anthropicAPIKey ?? "")
         _openAIKey = State(initialValue: settings.openAIAPIKey ?? "")
         _model = State(initialValue: settings.model)
+        // Render an integer budget without a trailing ".0".
+        let b = settings.monthlyBudgetUSD
+        _budget = State(initialValue: b == b.rounded() ? String(Int(b)) : String(b))
         self.onSave = onSave
     }
 
@@ -61,6 +65,15 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Monthly OpenAI budget (USD)")
+                    .font(.subheadline).foregroundColor(.secondary)
+                TextField("20", text: $budget)
+                    .textFieldStyle(.roundedBorder)
+                Text("IRIS meters realtime + voice spend. As this cap is approached it falls back to the free claude -p pipeline, then to on-device voice. 0 = unlimited.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+
             HStack {
                 if savedNote {
                     Text("Saved.")
@@ -69,7 +82,7 @@ struct SettingsView: View {
                 }
                 Spacer()
                 Button("Save") {
-                    onSave(anthropicKey, openAIKey, model)
+                    onSave(anthropicKey, openAIKey, model, budget)
                     withAnimation { savedNote = true }
                 }
                 .keyboardShortcut(.defaultAction)
@@ -88,7 +101,7 @@ final class SettingsWindowController {
     private var window: NSWindow?
 
     func show(settings: IRISSettings,
-              onSave: @escaping (String, String, String) -> Void) {
+              onSave: @escaping (String, String, String, String) -> Void) {
         if window == nil {
             let view = SettingsView(settings: settings, onSave: onSave)
             let hosting = NSHostingController(rootView: view)

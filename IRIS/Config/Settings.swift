@@ -109,6 +109,24 @@ public struct Settings: Sendable {
     /// fail to deliver input), so default OFF → reliable half-duplex (mic muted while IRIS speaks).
     public var echoCancellation: Bool
 
+    // MARK: - Self-learning memory ("the brain")
+
+    /// Persist + recall a self-learning memory at `~/.iris/memory.json` (+ readable `IRIS.md`).
+    /// When off, IRIS neither injects nor writes learned facts/rules. Env `IRIS_MEMORY`.
+    public var memoryEnabled: Bool
+
+    /// Pass `--dangerously-skip-permissions` when starting a Claude Code session. Default true
+    /// (today's behavior — the trust-folder prompt is skipped). Set false so the prompt appears
+    /// and IRIS can learn to handle it via a uiRule. Env `IRIS_CLAUDE_SKIP_PERMS`.
+    public var claudeSkipPermissions: Bool
+
+    // MARK: - Cost control (CostGovernor)
+
+    /// Hard monthly OpenAI spend cap in USD. The CostGovernor meters realtime + TTS spend and,
+    /// as this budget burns down, degrades the experience: realtime → classic `claude -p` →
+    /// on-device TTS. `0` means unlimited (no governing). Env `IRIS_MONTHLY_BUDGET`.
+    public var monthlyBudgetUSD: Double
+
     // MARK: - Defaults
 
     public static let defaultModel = "claude-sonnet-4-6"
@@ -122,9 +140,12 @@ public struct Settings: Sendable {
     public static let defaultTTSInstructions =
         "Speak in a warm, natural, conversational tone, like a friendly person chatting — "
         + "relaxed pacing, not robotic or overly formal."
-    public static let defaultRealtimeModel = "gpt-realtime"
+    // Cost-optimized realtime model: gpt-realtime-mini is ~3.2× cheaper on audio than full
+    // gpt-realtime ($10/$20 vs $32/$64 per 1M audio tokens). Override with IRIS_REALTIME_MODEL.
+    public static let defaultRealtimeModel = "gpt-realtime-mini"
     public static let defaultRealtimeVoice = "marin"
     public static let defaultIdlePauseSeconds = 15
+    public static let defaultMonthlyBudgetUSD = 20.0
 
     public init(
         claudeBinary: String,
@@ -152,7 +173,10 @@ public struct Settings: Sendable {
         idlePauseSeconds: Int = Settings.defaultIdlePauseSeconds,
         computerUseEnabled: Bool = true,
         screenAwareness: String = "onDemand",
-        echoCancellation: Bool = false
+        echoCancellation: Bool = false,
+        memoryEnabled: Bool = true,
+        claudeSkipPermissions: Bool = true,
+        monthlyBudgetUSD: Double = Settings.defaultMonthlyBudgetUSD
     ) {
         self.claudeBinary = claudeBinary
         self.anthropicAPIKey = anthropicAPIKey
@@ -180,6 +204,9 @@ public struct Settings: Sendable {
         self.computerUseEnabled = computerUseEnabled
         self.screenAwareness = screenAwareness
         self.echoCancellation = echoCancellation
+        self.memoryEnabled = memoryEnabled
+        self.claudeSkipPermissions = claudeSkipPermissions
+        self.monthlyBudgetUSD = monthlyBudgetUSD
     }
 
     // MARK: - Loading
@@ -247,6 +274,12 @@ public struct Settings: Sendable {
         let computerUse = parseBool(value("computerUseEnabled", "IRIS_COMPUTER_USE")) ?? true
         let screenAwareness = value("screenAwareness", "IRIS_SCREEN_AWARENESS") ?? "onDemand"
         let echoCancellation = parseBool(value("echoCancellation", "IRIS_ECHO_CANCEL")) ?? false
+        let memoryEnabled = parseBool(value("memoryEnabled", "IRIS_MEMORY")) ?? true
+        let claudeSkipPermissions = parseBool(value("claudeSkipPermissions", "IRIS_CLAUDE_SKIP_PERMS")) ?? true
+
+        // Monthly OpenAI spend cap (USD). 0 = unlimited.
+        let monthlyBudget = value("monthlyBudgetUSD", "IRIS_MONTHLY_BUDGET").flatMap(Double.init)
+            ?? defaultMonthlyBudgetUSD
 
         return Settings(
             claudeBinary: claudeBinary,
@@ -274,7 +307,10 @@ public struct Settings: Sendable {
             idlePauseSeconds: idlePause,
             computerUseEnabled: computerUse,
             screenAwareness: screenAwareness,
-            echoCancellation: echoCancellation
+            echoCancellation: echoCancellation,
+            memoryEnabled: memoryEnabled,
+            claudeSkipPermissions: claudeSkipPermissions,
+            monthlyBudgetUSD: monthlyBudget
         )
     }
 
@@ -290,9 +326,11 @@ public struct Settings: Sendable {
 
     // MARK: - Persistence (menu-bar Settings write-back)
 
-    /// Return a copy with updated API keys / model — used by the Settings window before
-    /// saving and re-applying. Empty strings are normalized to `nil` (key cleared).
-    public func withUpdatedKeys(anthropic: String, openAI: String, model: String) -> Settings {
+    /// Return a copy with updated API keys / model / monthly budget — used by the Settings window
+    /// before saving and re-applying. Empty strings are normalized to `nil` (key cleared); a blank
+    /// or unparseable budget keeps the current value.
+    public func withUpdatedKeys(anthropic: String, openAI: String, model: String,
+                                budget: String) -> Settings {
         func nilIfEmpty(_ s: String) -> String? {
             let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
             return t.isEmpty ? nil : t
@@ -302,6 +340,8 @@ public struct Settings: Sendable {
         copy.openAIAPIKey = nilIfEmpty(openAI)
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         copy.model = trimmedModel.isEmpty ? Settings.defaultModel : trimmedModel
+        let trimmedBudget = budget.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let b = Double(trimmedBudget), b >= 0 { copy.monthlyBudgetUSD = b }
         return copy
     }
 
@@ -328,6 +368,7 @@ public struct Settings: Sendable {
         obj["voice"] = voice
         obj["wakePhrase"] = wakePhrase
         obj["ttsRate"] = ttsRate
+        obj["monthlyBudgetUSD"] = monthlyBudgetUSD
         // claudeBinary is deliberately NOT written — preserve the auto-probe on next launch.
 
         let data = try JSONSerialization.data(
