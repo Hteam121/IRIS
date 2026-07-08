@@ -101,6 +101,64 @@ struct OverlayView: View {
     }
 }
 
+/// Cursor-buddy layout (Clicky-style): a compact orb + caption bubble that lives near the
+/// pointer (FloatingPanel moves the window; this view only renders). Reuses the same orb,
+/// caption text, and agent pills as the notch island.
+struct BuddyView: View {
+    @ObservedObject var appState: AppState
+
+    private var displayText: String {
+        appState.responseText.isEmpty ? appState.transcript : appState.responseText
+    }
+    private var hasText: Bool { !displayText.isEmpty }
+    private var isVisible: Bool {
+        appState.status != .idle || hasText || !appState.backgroundTasks.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if isVisible {
+                HStack(alignment: .top, spacing: 8) {
+                    OrbView(status: appState.status)
+                        .padding(.top, hasText ? 10 : 0)
+                    if hasText {
+                        Text(displayText)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white)
+                            .lineLimit(6)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .background(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .fill(Color.black.opacity(0.92))
+                                    .shadow(color: .black.opacity(0.4), radius: 10, y: 4)
+                            )
+                            .frame(maxWidth: 340, alignment: .leading)
+                    }
+                }
+                .transition(.scale(scale: 0.9, anchor: .topLeading).combined(with: .opacity))
+            }
+            if !appState.backgroundTasks.isEmpty {
+                VStack(spacing: 5) {
+                    ForEach(Array(appState.backgroundTasks.prefix(4))) { task in
+                        AgentPillRow(task: task)
+                    }
+                }
+                .frame(maxWidth: 340)
+                .transition(.opacity)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .animation(.spring(response: 0.32, dampingFraction: 0.8), value: isVisible)
+        .animation(.spring(response: 0.32, dampingFraction: 0.8), value: appState.responseText)
+        .animation(.easeInOut(duration: 0.25), value: appState.status)
+        .animation(.spring(response: 0.40, dampingFraction: 0.85), value: appState.backgroundTasks)
+    }
+}
+
 /// The status indicator: a 16pt circle whose color reflects `IRISStatus` and which pulses
 /// (1.0 ⇄ 1.3) while IRIS is active. See docs/algorithms.md → Orb animation.
 struct OrbView: View {
@@ -177,6 +235,12 @@ struct AgentPillRow: View {
                         .foregroundStyle(.white.opacity(0.75))
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
+                } else if let progress = task.progressText, task.state == .running, !progress.isEmpty {
+                    // Live tool-use progress streamed from the Claude session ("Editing README.md").
+                    Text(progress)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .lineLimit(1)
                 } else {
                     Text(stateLabel)
                         .font(.system(size: 11))

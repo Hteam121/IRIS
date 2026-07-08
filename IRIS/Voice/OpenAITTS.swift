@@ -24,7 +24,7 @@ enum OpenAITTS {
             "voice": settings.ttsVoice,
             "input": text,
             "response_format": "mp3",
-            "speed": 1.0,
+            "speed": min(max(settings.ttsSpeed, 0.25), 4.0),
         ]
         // gpt-4o-mini-tts accepts an `instructions` field to steer tone; harmless on models
         // that ignore it.

@@ -26,8 +26,8 @@ enum ComputerControl {
     }
 
     private static var notTrustedMessage: String {
-        "I need Accessibility permission to control your Mac. Enable IRIS in System Settings → "
-            + "Privacy & Security → Accessibility, then try again."
+        "I need Accessibility permission to control your Mac. Enable \(Persona.name) in System "
+            + "Settings → Privacy & Security → Accessibility, then try again."
     }
 
     /// Type arbitrary text wherever the cursor is, using synthesized Unicode key events.

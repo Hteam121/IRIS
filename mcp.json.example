@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to ~/.iris/mcp.json and fill in. This is a standard Claude Code --mcp-config file: each entry under mcpServers is an MCP server background sessions load tools from. The Google Calendar example uses the @cocal/google-calendar-mcp npm server via npx; first run opens a Google OAuth consent screen.",
+  "mcpServers": {
+    "google-calendar": {
+      "command": "npx",
+      "args": ["-y", "@cocal/google-calendar-mcp"],
+      "env": {
+        "GOOGLE_OAUTH_CREDENTIALS": "~/.iris/gcp-oauth.keys.json"
+      }
+    }
+  }
+}

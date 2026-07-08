@@ -23,26 +23,20 @@ enum ScreenRuleEngine {
     /// Look at the screen and apply the first matching learned `uiRule`. Returns a short spoken
     /// note when it acted, or nil (no rules, no match, or can't act).
     static func applyLearnedRules(memory: MemoryStore, screenCapture: ScreenCapture,
-                                  settings: Settings, costGovernor: CostGovernor?,
+                                  settings: Settings, engine: ClaudeEngine,
                                   renderDelay: TimeInterval = 1.2) async -> String? {
         guard settings.memoryEnabled, settings.computerUseEnabled else { return nil }
         let rules = memory.uiRules
         guard !rules.isEmpty else { return nil }
-        guard let key = settings.openAIAPIKey, !key.isEmpty else { return nil }
-        // Budget gate: the paid gpt-4o vision match must not run once the budget is spent (.free),
-        // which would otherwise break that tier's "zero OpenAI spend" guarantee.
-        guard let costGovernor, costGovernor.allowsPaidVision else { return nil }
 
         // Let the just-launched UI render before we look.
         if renderDelay > 0 {
             try? await Task.sleep(nanoseconds: UInt64(renderDelay * 1_000_000_000))
         }
 
-        guard let path = await screenCapture.capture(),
-              let imgData = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        guard let path = await screenCapture.capture() else { return nil }
 
-        guard let match = await matchRule(rules: rules, imageData: imgData, apiKey: key,
-                                          costGovernor: costGovernor),
+        guard let match = await matchRule(rules: rules, imagePath: path, engine: engine),
               rules.indices.contains(match.index) else { return nil }
 
         let rule = rules[match.index]
@@ -65,17 +59,17 @@ enum ScreenRuleEngine {
     /// was started and memory is available; it self-gates on memory/computer-use/budget.
     static func openTerminalApplyingRules(
         in directory: String, startClaude: Bool, settings: Settings,
-        memory: MemoryStore?, screenCapture: ScreenCapture, costGovernor: CostGovernor?
+        memory: MemoryStore?, screenCapture: ScreenCapture, engine: ClaudeEngine
     ) async -> String {
         let reply = await TerminalLauncher.open(
             in: directory, claudeBinary: settings.claudeBinary, startClaude: startClaude,
             skipPermissions: settings.claudeSkipPermissions)
-        // Don't spend a paid vision call if the surrounding task was interrupted right after launch.
+        // Don't spend a vision call if the surrounding task was interrupted right after launch.
         if Task.isCancelled { return reply }
         guard startClaude, let memory,
               let note = await applyLearnedRules(
                   memory: memory, screenCapture: screenCapture, settings: settings,
-                  costGovernor: costGovernor) else {
+                  engine: engine) else {
             return reply
         }
         return reply + " " + note
@@ -99,14 +93,14 @@ enum ScreenRuleEngine {
         }
     }
 
-    // MARK: - Vision match (OpenAI gpt-4o, strict JSON)
+    // MARK: - Vision match (ClaudeEngine, strict JSON)
 
     private struct Match { let index: Int; let x: Double?; let y: Double? }
 
-    /// Ask gpt-4o whether the screenshot shows one of the learned situations. Returns the matched
-    /// rule index (0-based) plus optional click coordinates, or nil for no match.
-    private static func matchRule(rules: [MemoryItem], imageData: Data, apiKey: String,
-                                  costGovernor: CostGovernor?) async -> Match? {
+    /// Ask the vision model whether the screenshot shows one of the learned situations. Returns
+    /// the matched rule index (0-based) plus optional click coordinates, or nil for no match.
+    private static func matchRule(rules: [MemoryItem], imagePath: String,
+                                  engine: ClaudeEngine) async -> Match? {
         let list = rules.enumerated()
             .map { "\($0.offset + 1). \($0.element.trigger ?? $0.element.text)" }
             .joined(separator: "\n")
@@ -123,14 +117,12 @@ enum ScreenRuleEngine {
         on the matched situation; otherwise use null.
         """
 
-        guard let reply = await OpenAIVision.complete(
-            imageData: imageData, instruction: instruction, apiKey: apiKey,
-            maxTokens: 100, jsonMode: true) else { return nil }
-        // Meter this paid call against the monthly budget (cost is incurred whether or not it matched).
-        costGovernor?.recordVision(usage: reply.usage)
-        guard let content = reply.content,
+        guard let content = await engine.visionJSON(
+            imagePath: imagePath, instruction: instruction, maxTokens: 100) else { return nil }
+        guard let start = content.firstIndex(of: "{"), let end = content.lastIndex(of: "}"),
+              start < end,
               let parsed = try? JSONSerialization.jsonObject(
-                with: Data(content.utf8)) as? [String: Any] else { return nil }
+                with: Data(String(content[start...end]).utf8)) as? [String: Any] else { return nil }
 
         let matchNum = (parsed["match"] as? NSNumber)?.intValue ?? 0
         guard matchNum >= 1 else { return nil }

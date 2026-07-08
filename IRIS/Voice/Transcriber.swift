@@ -3,7 +3,7 @@
 //  IRIS — Voice + Audio lane (Phase 1)
 //
 //  A one-shot spoken-command capturer built on AVAudioEngine + SFSpeechRecognizer.
-//  `WakeWordDetector` uses this for the "hey iris" → [pause] → command case, where the
+//  `WakeWordDetector` uses this for the "hey dory" → [pause] → command case, where the
 //  command arrives in a fresh utterance after the wake phrase. It captures a single
 //  utterance and returns the trimmed transcript when the speaker pauses (silence) or the
 //  hard max-duration elapses.
@@ -66,6 +66,8 @@ final class Transcriber: NSObject {
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }
+        // Bias the recognizer toward the assistant's vocabulary ("dory agent ..." commands).
+        request.contextualStrings = [Persona.name, Persona.agentTrigger]
         self.request = request
 
         let input = engine.inputNode

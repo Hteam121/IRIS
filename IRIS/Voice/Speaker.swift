@@ -51,6 +51,9 @@ final class Speaker: NSObject {
     /// The best available system voice (fallback path), cached after first lookup.
     private lazy var preferredVoice: AVSpeechSynthesisVoice? = resolveVoice()
 
+    /// Pluggable neural-TTS backend (OpenAI today; an ElevenLabs conformance is a drop-in).
+    private let ttsProvider: TTSProvider = OpenAITTSProvider()
+
     init(settings: Settings, appState: AppState, costGovernor: CostGovernor? = nil) {
         self.settings = settings
         self.appState = appState
@@ -117,7 +120,7 @@ final class Speaker: NSObject {
         if useOpenAI {
             ttsTask = Task { [weak self] in
                 guard let self else { return }
-                let data = await OpenAITTS.synthesize(text: text, settings: self.settings)
+                let data = await self.ttsProvider.synthesize(text: text, settings: self.settings)
                 if gen != self.generation { return }     // superseded or stopped while fetching
                 if let data, self.play(data) {
                     self.costGovernor?.recordTTS(characters: text.count)

@@ -293,10 +293,10 @@ public final class MemoryStore: ObservableObject {
             return out
         }
         let header = """
-        # IRIS — Learned Memory
+        # \(Persona.name) — Learned Memory
 
         This file is auto-generated from `~/.iris/memory.json` (the source of truth). Edits here are
-        overwritten on the next save — change `memory.json` to make lasting edits, or just tell IRIS.
+        overwritten on the next save — change `memory.json` to make lasting edits, or just tell \(Persona.name).
 
         """
         let sections = [

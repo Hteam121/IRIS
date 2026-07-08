@@ -49,6 +49,10 @@ public struct AgentTask: Identifiable, Sendable, Equatable {
     public var resultSummary: String?
     /// When `state == .waitingForUser`, the question the agent is asking the user.
     public var question: String?
+    /// Resumable `claude` session id, once the session's init event arrives (additive).
+    public var sessionId: String?
+    /// Live one-line progress ("Editing README.md"), streamed from tool-use events (additive).
+    public var progressText: String?
 
     public init(
         id: String,
@@ -59,7 +63,9 @@ public struct AgentTask: Identifiable, Sendable, Equatable {
         startedAt: Date = Date(),
         finishedAt: Date? = nil,
         resultSummary: String? = nil,
-        question: String? = nil
+        question: String? = nil,
+        sessionId: String? = nil,
+        progressText: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -70,5 +76,7 @@ public struct AgentTask: Identifiable, Sendable, Equatable {
         self.finishedAt = finishedAt
         self.resultSummary = resultSummary
         self.question = question
+        self.sessionId = sessionId
+        self.progressText = progressText
     }
 }

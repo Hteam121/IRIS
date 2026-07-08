@@ -3,8 +3,8 @@
 //  IRIS — Actions lane
 //
 //  Direct macOS app launching via NSWorkspace. Used for simple "open <app>" commands so
-//  IRIS can act instantly without spawning an agent. The IntentRouter routes open-app
-//  intents here; complex multi-step tasks still go through AgentMode (the claude agent).
+//  IRIS can act instantly without spawning an agent. The Router routes open-app intents
+//  here; complex multi-step tasks go through ClaudeSessionManager.
 //
 
 import AppKit

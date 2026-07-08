@@ -20,12 +20,11 @@ public struct Settings: Sendable {
     /// if not found, in which case the API path must be used).
     public var claudeBinary: String
 
-    /// Anthropic API key. When present, `IRISBrain` uses the Messages API with real
-    /// base64 vision instead of `claude -p`.
+    /// Anthropic API key. When present, `ClaudeEngine` uses the Messages API (streaming,
+    /// prompt caching, real base64 vision) instead of `claude -p`.
     public var anthropicAPIKey: String?
 
-    /// OpenAI API key. When present, `IntentRouter` uses OpenAI function-calling to
-    /// classify each command into an action (open app / run agent / answer).
+    /// OpenAI API key. Used only for neural TTS (gpt-4o-mini-tts).
     public var openAIAPIKey: String?
 
     /// Model id. Default `claude-sonnet-4-6`; `claude-haiku-4-5-20251001` for speed.
@@ -44,26 +43,31 @@ public struct Settings: Sendable {
     /// Case-insensitive wake phrase, lowercased (see docs/algorithms.md → wake word).
     public var wakePhrase: String
 
-    // MARK: - Background agents (LangGraph sidecar)
+    /// Also wake on the bare assistant name ANYWHERE in a sentence ("…, Dory?").
+    /// Env `IRIS_WAKE_NAME_ONLY`.
+    public var wakeNameOnly: Bool
 
-    /// Absolute path to the sidecar venv's Python (e.g. sidecar/.venv/bin/python). When set,
-    /// IRIS spawns the sidecar itself; when nil it only tries to connect to an already-running one.
-    public var sidecarPython: String?
+    /// Push-to-talk chord: hold this key (virtual keycode; 49 = Space)…
+    public var pttKeyCode: UInt16
+    /// …with these modifier flags (NSEvent.ModifierFlags raw value; default ⌥).
+    public var pttModifiers: UInt
 
-    /// Localhost port the sidecar serves on (must match the sidecar's IRIS_SIDECAR_PORT).
-    public var sidecarPort: Int
+    /// Main surface: "buddy" (cursor-following orb + caption, Clicky-style) or "notch"
+    /// (island anchored over the camera). Env `IRIS_UI_MODE`.
+    public var uiMode: String
+
+    // MARK: - Background agents (Claude Code sessions)
 
     /// Default working directory for terminal / agent tasks (tilde expanded).
     public var defaultAgentDirectory: String
 
-    /// Max background agents allowed to run at once (passed to the sidecar).
+    /// Max background agent sessions allowed to run at once.
     public var maxConcurrentAgents: Int
 
     /// Whether voice barge-in (interrupt while speaking) is enabled.
     public var bargeInEnabled: Bool
 
-    /// Model the sidecar agents reason with. Nil → the sidecar's own default
-    /// (foreground Q&A always uses `model`).
+    /// Model background agent sessions reason with. Nil → `model`.
     public var agentModel: String?
 
     // MARK: - Neural voice (OpenAI TTS)
@@ -81,33 +85,13 @@ public struct Settings: Sendable {
     /// Tone/style instructions for gpt-4o-mini-tts (how the voice should sound).
     public var ttsInstructions: String
 
-    // MARK: - Realtime (Jarvis/Cluely speech-to-speech core)
+    /// OpenAI TTS speed multiplier (0.25–4.0; 1.0 = normal). Env `IRIS_TTS_SPEED`.
+    public var ttsSpeed: Double
 
-    /// Use the OpenAI Realtime API speech-to-speech core (continuous conversation) instead of the
-    /// classic wake-word → one-shot pipeline. Needs an OpenAI key.
-    public var realtimeEnabled: Bool
-
-    /// Realtime model id (e.g. gpt-realtime).
-    public var realtimeModel: String
-
-    /// Realtime voice (e.g. marin, cedar, alloy, ash, sage, verse).
-    public var realtimeVoice: String
-
-    /// Keep listening continuously (true) vs require a hotkey to talk (false).
-    public var alwaysOn: Bool
-
-    /// Pause the upstream after this many seconds of silence (cost control); resumes on sound.
-    public var idlePauseSeconds: Int
+    // MARK: - Mac control
 
     /// Allow IRIS to control the Mac (type/click) via Accessibility.
     public var computerUseEnabled: Bool
-
-    /// Screen awareness: "onDemand" (model asks via a tool) or "proactive" (periodic capture).
-    public var screenAwareness: String
-
-    /// Try hardware echo cancellation (full-duplex barge-in). Flaky on some Macs (the engine can
-    /// fail to deliver input), so default OFF → reliable half-duplex (mic muted while IRIS speaks).
-    public var echoCancellation: Bool
 
     // MARK: - Self-learning memory ("the brain")
 
@@ -122,30 +106,58 @@ public struct Settings: Sendable {
 
     // MARK: - Cost control (CostGovernor)
 
-    /// Hard monthly OpenAI spend cap in USD. The CostGovernor meters realtime + TTS spend and,
-    /// as this budget burns down, degrades the experience: realtime → classic `claude -p` →
-    /// on-device TTS. `0` means unlimited (no governing). Env `IRIS_MONTHLY_BUDGET`.
+    /// Hard monthly OpenAI spend cap in USD. The CostGovernor meters TTS + vision spend and,
+    /// as this budget burns down, degrades the experience toward the free `claude -p` pipeline
+    /// and on-device TTS. `0` means unlimited (no governing). Env `IRIS_MONTHLY_BUDGET`.
     public var monthlyBudgetUSD: Double
+
+    // MARK: - Screen pointing (PointerOverlay)
+
+    /// Show the animated on-screen pointer when the model wants to point at a UI element.
+    /// Env `IRIS_POINTER`.
+    public var pointerEnabled: Bool
+
+    // MARK: - Skills (~/.iris/skills/*.md)
+
+    /// Discover markdown skills at `~/.iris/skills/` and expose them via the `run_skill`
+    /// tool + prompt catalog. Env `IRIS_SKILLS`.
+    public var skillsEnabled: Bool
+
+    // MARK: - Local-first routing (Ollama / Apple Foundation Models)
+
+    /// Try a free local model for simple foreground questions before paying for the cloud.
+    /// Env `IRIS_LOCAL_LLM`.
+    public var localLLMEnabled: Bool
+
+    /// Ollama model name used for local answers. Env `IRIS_LOCAL_MODEL`.
+    public var localModel: String
+
+    /// Base URL of the Ollama server. Env `IRIS_OLLAMA_URL`.
+    public var ollamaURL: String
 
     // MARK: - Defaults
 
     public static let defaultModel = "claude-sonnet-4-6"
     public static let defaultVoice = "en-US"
     public static let defaultTTSRate: Float = 0.52
-    public static let defaultWakePhrase = "hey iris"
-    public static let defaultSidecarPort = 8765
+    public static let defaultWakePhrase = "hey dory"
+    /// The pre-rename default. A persisted config.json equal to this is treated as "never
+    /// customized" and migrated to the new default at load (see `load()`).
+    public static let legacyDefaultWakePhrase = "hey iris"
     public static let defaultMaxConcurrentAgents = 4
-    public static let defaultTTSVoice = "sage"
+    /// Space (49) held with ⌥ (option = 1 << 19 in NSEvent.ModifierFlags).
+    public static let defaultPTTKeyCode: UInt16 = 49
+    public static let defaultPTTModifiers: UInt = 1 << 19
+    public static let defaultTTSVoice = "nova"
     public static let defaultTTSModel = "gpt-4o-mini-tts"
     public static let defaultTTSInstructions =
-        "Speak in a warm, natural, conversational tone, like a friendly person chatting — "
-        + "relaxed pacing, not robotic or overly formal."
-    // Cost-optimized realtime model: gpt-realtime-mini is ~3.2× cheaper on audio than full
-    // gpt-realtime ($10/$20 vs $32/$64 per 1M audio tokens). Override with IRIS_REALTIME_MODEL.
-    public static let defaultRealtimeModel = "gpt-realtime-mini"
-    public static let defaultRealtimeVoice = "marin"
-    public static let defaultIdlePauseSeconds = 15
+        "Speak as a warm, friendly female voice with a QUICK, energetic pace — snappy and "
+        + "efficient like a sharp assistant, never slow or drawn out, but still natural."
+    /// Playback speed multiplier for OpenAI TTS (1.0 = normal). Env `IRIS_TTS_SPEED`.
+    public static let defaultTTSSpeed = 1.15
     public static let defaultMonthlyBudgetUSD = 20.0
+    public static let defaultLocalModel = "llama3.2"
+    public static let defaultOllamaURL = "http://localhost:11434"
 
     public init(
         claudeBinary: String,
@@ -156,8 +168,10 @@ public struct Settings: Sendable {
         voiceIdentifier: String?,
         ttsRate: Float,
         wakePhrase: String,
-        sidecarPython: String? = nil,
-        sidecarPort: Int = Settings.defaultSidecarPort,
+        wakeNameOnly: Bool = true,
+        pttKeyCode: UInt16 = Settings.defaultPTTKeyCode,
+        pttModifiers: UInt = Settings.defaultPTTModifiers,
+        uiMode: String = "buddy",
         defaultAgentDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path,
         maxConcurrentAgents: Int = Settings.defaultMaxConcurrentAgents,
         bargeInEnabled: Bool = false,
@@ -166,17 +180,16 @@ public struct Settings: Sendable {
         ttsVoice: String = Settings.defaultTTSVoice,
         ttsModel: String = Settings.defaultTTSModel,
         ttsInstructions: String = Settings.defaultTTSInstructions,
-        realtimeEnabled: Bool = true,
-        realtimeModel: String = Settings.defaultRealtimeModel,
-        realtimeVoice: String = Settings.defaultRealtimeVoice,
-        alwaysOn: Bool = true,
-        idlePauseSeconds: Int = Settings.defaultIdlePauseSeconds,
+        ttsSpeed: Double = Settings.defaultTTSSpeed,
         computerUseEnabled: Bool = true,
-        screenAwareness: String = "onDemand",
-        echoCancellation: Bool = false,
         memoryEnabled: Bool = true,
         claudeSkipPermissions: Bool = true,
-        monthlyBudgetUSD: Double = Settings.defaultMonthlyBudgetUSD
+        monthlyBudgetUSD: Double = Settings.defaultMonthlyBudgetUSD,
+        pointerEnabled: Bool = true,
+        skillsEnabled: Bool = true,
+        localLLMEnabled: Bool = true,
+        localModel: String = Settings.defaultLocalModel,
+        ollamaURL: String = Settings.defaultOllamaURL
     ) {
         self.claudeBinary = claudeBinary
         self.anthropicAPIKey = anthropicAPIKey
@@ -186,8 +199,10 @@ public struct Settings: Sendable {
         self.voiceIdentifier = voiceIdentifier
         self.ttsRate = ttsRate
         self.wakePhrase = wakePhrase
-        self.sidecarPython = sidecarPython
-        self.sidecarPort = sidecarPort
+        self.wakeNameOnly = wakeNameOnly
+        self.pttKeyCode = pttKeyCode
+        self.pttModifiers = pttModifiers
+        self.uiMode = uiMode
         self.defaultAgentDirectory = defaultAgentDirectory
         self.maxConcurrentAgents = maxConcurrentAgents
         self.bargeInEnabled = bargeInEnabled
@@ -196,17 +211,16 @@ public struct Settings: Sendable {
         self.ttsVoice = ttsVoice
         self.ttsModel = ttsModel
         self.ttsInstructions = ttsInstructions
-        self.realtimeEnabled = realtimeEnabled
-        self.realtimeModel = realtimeModel
-        self.realtimeVoice = realtimeVoice
-        self.alwaysOn = alwaysOn
-        self.idlePauseSeconds = idlePauseSeconds
+        self.ttsSpeed = ttsSpeed
         self.computerUseEnabled = computerUseEnabled
-        self.screenAwareness = screenAwareness
-        self.echoCancellation = echoCancellation
         self.memoryEnabled = memoryEnabled
         self.claudeSkipPermissions = claudeSkipPermissions
         self.monthlyBudgetUSD = monthlyBudgetUSD
+        self.pointerEnabled = pointerEnabled
+        self.skillsEnabled = skillsEnabled
+        self.localLLMEnabled = localLLMEnabled
+        self.localModel = localModel
+        self.ollamaURL = ollamaURL
     }
 
     // MARK: - Loading
@@ -229,8 +243,12 @@ public struct Settings: Sendable {
         let voice = value("voice", "IRIS_VOICE") ?? defaultVoice
         // Optional explicit AVSpeechSynthesisVoice identifier (e.g. a downloaded Siri voice).
         let voiceIdentifier = value("voiceIdentifier", "IRIS_VOICE_ID")
-        let wakePhrase = (value("wakePhrase", "IRIS_WAKE_PHRASE") ?? defaultWakePhrase)
+        var wakePhrase = (value("wakePhrase", "IRIS_WAKE_PHRASE") ?? defaultWakePhrase)
             .lowercased()
+        // Migration: the Settings window used to persist the old default ("hey iris") to
+        // config.json, which would silently pin the pre-rename phrase forever. Treat the old
+        // default as "never customized"; any other custom phrase is respected verbatim.
+        if wakePhrase == legacyDefaultWakePhrase { wakePhrase = defaultWakePhrase }
 
         let ttsRate: Float = {
             if let s = value("ttsRate", "IRIS_TTS_RATE"), let f = Float(s) { return f }
@@ -241,10 +259,15 @@ public struct Settings: Sendable {
         let claudeBinary = value("claudeBinary", "IRIS_CLAUDE_BINARY")
             ?? resolveClaudeBinary()
 
-        // Background-agent sidecar config.
-        let sidecarPython = value("sidecarPython", "IRIS_SIDECAR_PYTHON")
-        let sidecarPort = value("sidecarPort", "IRIS_SIDECAR_PORT").flatMap(Int.init)
-            ?? defaultSidecarPort
+        // Triggers.
+        let wakeNameOnly = parseBool(value("wakeNameOnly", "IRIS_WAKE_NAME_ONLY")) ?? true
+        let pttKeyCode = value("pttKeyCode", "IRIS_PTT_KEYCODE").flatMap(UInt16.init)
+            ?? defaultPTTKeyCode
+        let pttModifiers = value("pttModifiers", "IRIS_PTT_MODIFIERS").flatMap(UInt.init)
+            ?? defaultPTTModifiers
+        let uiMode = value("uiMode", "IRIS_UI_MODE") ?? "buddy"
+
+        // Background-agent config.
         let defaultAgentDir = (value("defaultAgentDirectory", "IRIS_AGENT_DIR")
             .map { ($0 as NSString).expandingTildeInPath })
             ?? FileManager.default.homeDirectoryForCurrentUser.path
@@ -263,23 +286,24 @@ public struct Settings: Sendable {
         let ttsModel = value("ttsModel", "IRIS_TTS_MODEL") ?? defaultTTSModel
         let ttsInstructions = value("ttsInstructions", "IRIS_TTS_INSTRUCTIONS")
             ?? defaultTTSInstructions
+        let ttsSpeed = value("ttsSpeed", "IRIS_TTS_SPEED").flatMap(Double.init)
+            ?? defaultTTSSpeed
 
-        // Realtime core.
-        let realtimeEnabled = parseBool(value("realtimeEnabled", "IRIS_REALTIME")) ?? true
-        let realtimeModel = value("realtimeModel", "IRIS_REALTIME_MODEL") ?? defaultRealtimeModel
-        let realtimeVoice = value("realtimeVoice", "IRIS_REALTIME_VOICE") ?? defaultRealtimeVoice
-        let alwaysOn = parseBool(value("alwaysOn", "IRIS_ALWAYS_ON")) ?? true
-        let idlePause = value("idlePauseSeconds", "IRIS_IDLE_PAUSE").flatMap(Int.init)
-            ?? defaultIdlePauseSeconds
+        // Stale realtime keys in an existing config.json / .env are deliberately ignored.
         let computerUse = parseBool(value("computerUseEnabled", "IRIS_COMPUTER_USE")) ?? true
-        let screenAwareness = value("screenAwareness", "IRIS_SCREEN_AWARENESS") ?? "onDemand"
-        let echoCancellation = parseBool(value("echoCancellation", "IRIS_ECHO_CANCEL")) ?? false
         let memoryEnabled = parseBool(value("memoryEnabled", "IRIS_MEMORY")) ?? true
         let claudeSkipPermissions = parseBool(value("claudeSkipPermissions", "IRIS_CLAUDE_SKIP_PERMS")) ?? true
 
         // Monthly OpenAI spend cap (USD). 0 = unlimited.
         let monthlyBudget = value("monthlyBudgetUSD", "IRIS_MONTHLY_BUDGET").flatMap(Double.init)
             ?? defaultMonthlyBudgetUSD
+
+        // Screen pointing, skills, local-first routing.
+        let pointerEnabled = parseBool(value("pointerEnabled", "IRIS_POINTER")) ?? true
+        let skillsEnabled = parseBool(value("skillsEnabled", "IRIS_SKILLS")) ?? true
+        let localLLMEnabled = parseBool(value("localLLMEnabled", "IRIS_LOCAL_LLM")) ?? true
+        let localModel = value("localModel", "IRIS_LOCAL_MODEL") ?? defaultLocalModel
+        let ollamaURL = value("ollamaURL", "IRIS_OLLAMA_URL") ?? defaultOllamaURL
 
         return Settings(
             claudeBinary: claudeBinary,
@@ -290,8 +314,10 @@ public struct Settings: Sendable {
             voiceIdentifier: voiceIdentifier,
             ttsRate: ttsRate,
             wakePhrase: wakePhrase,
-            sidecarPython: sidecarPython,
-            sidecarPort: sidecarPort,
+            wakeNameOnly: wakeNameOnly,
+            pttKeyCode: pttKeyCode,
+            pttModifiers: pttModifiers,
+            uiMode: uiMode,
             defaultAgentDirectory: defaultAgentDir,
             maxConcurrentAgents: maxAgents,
             bargeInEnabled: bargeIn,
@@ -300,17 +326,16 @@ public struct Settings: Sendable {
             ttsVoice: ttsVoice,
             ttsModel: ttsModel,
             ttsInstructions: ttsInstructions,
-            realtimeEnabled: realtimeEnabled,
-            realtimeModel: realtimeModel,
-            realtimeVoice: realtimeVoice,
-            alwaysOn: alwaysOn,
-            idlePauseSeconds: idlePause,
+            ttsSpeed: ttsSpeed,
             computerUseEnabled: computerUse,
-            screenAwareness: screenAwareness,
-            echoCancellation: echoCancellation,
             memoryEnabled: memoryEnabled,
             claudeSkipPermissions: claudeSkipPermissions,
-            monthlyBudgetUSD: monthlyBudget
+            monthlyBudgetUSD: monthlyBudget,
+            pointerEnabled: pointerEnabled,
+            skillsEnabled: skillsEnabled,
+            localLLMEnabled: localLLMEnabled,
+            localModel: localModel,
+            ollamaURL: ollamaURL
         )
     }
 
@@ -326,22 +351,35 @@ public struct Settings: Sendable {
 
     // MARK: - Persistence (menu-bar Settings write-back)
 
-    /// Return a copy with updated API keys / model / monthly budget — used by the Settings window
-    /// before saving and re-applying. Empty strings are normalized to `nil` (key cleared); a blank
-    /// or unparseable budget keeps the current value.
-    public func withUpdatedKeys(anthropic: String, openAI: String, model: String,
-                                budget: String) -> Settings {
+    /// The user-editable fields the Settings window round-trips.
+    public struct Form {
+        public var anthropicKey: String
+        public var openAIKey: String
+        public var model: String
+        public var budget: String
+        public var wakePhrase: String
+        public var ttsVoice: String
+        public var localLLMEnabled: Bool
+    }
+
+    /// Return a copy with the form's values applied — used by the Settings window before
+    /// saving and re-applying. Empty strings are normalized to `nil` (key cleared) or the
+    /// default; a blank or unparseable budget keeps the current value.
+    public func applying(_ form: Form) -> Settings {
         func nilIfEmpty(_ s: String) -> String? {
             let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
             return t.isEmpty ? nil : t
         }
         var copy = self
-        copy.anthropicAPIKey = nilIfEmpty(anthropic)
-        copy.openAIAPIKey = nilIfEmpty(openAI)
-        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        copy.model = trimmedModel.isEmpty ? Settings.defaultModel : trimmedModel
-        let trimmedBudget = budget.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let b = Double(trimmedBudget), b >= 0 { copy.monthlyBudgetUSD = b }
+        copy.anthropicAPIKey = nilIfEmpty(form.anthropicKey)
+        copy.openAIAPIKey = nilIfEmpty(form.openAIKey)
+        copy.model = nilIfEmpty(form.model) ?? Settings.defaultModel
+        if let b = Double(form.budget.trimmingCharacters(in: .whitespacesAndNewlines)), b >= 0 {
+            copy.monthlyBudgetUSD = b
+        }
+        copy.wakePhrase = (nilIfEmpty(form.wakePhrase) ?? Settings.defaultWakePhrase).lowercased()
+        copy.ttsVoice = nilIfEmpty(form.ttsVoice) ?? Settings.defaultTTSVoice
+        copy.localLLMEnabled = form.localLLMEnabled
         return copy
     }
 
@@ -369,6 +407,8 @@ public struct Settings: Sendable {
         obj["wakePhrase"] = wakePhrase
         obj["ttsRate"] = ttsRate
         obj["monthlyBudgetUSD"] = monthlyBudgetUSD
+        obj["ttsVoice"] = ttsVoice
+        obj["localLLMEnabled"] = localLLMEnabled
         // claudeBinary is deliberately NOT written — preserve the auto-probe on next launch.
 
         let data = try JSONSerialization.data(

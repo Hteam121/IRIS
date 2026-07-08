@@ -2,7 +2,7 @@
 //  WakeWordDetector.swift
 //  IRIS — Voice + Audio lane (Phase 1)
 //
-//  Continuous "hey iris" wake-word listener with command capture. Built on
+//  Continuous "hey dory" wake-word listener with command capture. Built on
 //  AVAudioEngine + SFSpeechRecognizer with a ~50s session-restart timer (the recognizer
 //  caps near 60s).
 //
@@ -12,11 +12,12 @@
 //  (plan.md fix #5).
 //
 //  Flow (see docs/algorithms.md → wake word):
-//    • Listen continuously; lowercase-`contains` match on the wake phrase.
+//    • Listen continuously; `WakePhraseMatcher` matches the wake phrase (+ mishearing
+//      variants of the default).
 //    • Once heard, keep accumulating the same utterance until the speaker pauses
 //      (settle timer). Strip the wake-phrase prefix → that remainder is the command
-//      ("hey iris what time is it" in one breath).
-//    • If nothing followed the wake phrase ("hey iris" then a pause), hand off to
+//      ("hey dory what time is it" in one breath).
+//    • If nothing followed the wake phrase ("hey dory" then a pause), hand off to
 //      `Transcriber` to capture the command as a fresh utterance.
 //    • Deliver the final command via `onWakeWordDetected`; AppDelegate (Phase 2) wires
 //      that to screen capture → IRISBrain.ask → Speaker.speak.
@@ -40,6 +41,7 @@ final class WakeWordDetector {
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private let transcriber: Transcriber
+    private let wakeMatcher: WakePhraseMatcher
 
     // Self-hearing gate (plan.md fix #5): `AppState.isSpeaking` is mirrored into `muted`
     // while IRIS talks. The realtime audio tap reads it under `muteLock` and skips
@@ -58,7 +60,7 @@ final class WakeWordDetector {
 
     // Voice barge-in: with barge-in enabled (default), the audio tap stays LIVE while IRIS
     // speaks (instead of muting) so the user can interrupt — but ONLY the wake phrase triggers
-    // it. IRIS never says "hey iris", so its own TTS (or background noise) can't self-trigger a
+    // it. IRIS never says "hey dory", so its own TTS (or background noise) can't self-trigger a
     // barge-in. When disabled, the tap is muted during speech (no voice barge-in; ⌥⎋ only).
     private let bargeInEnabled: Bool
 
@@ -99,6 +101,8 @@ final class WakeWordDetector {
         let locale = Locale(identifier: settings.voice)
         self.recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer()
         self.transcriber = Transcriber(settings: settings)
+        self.wakeMatcher = WakePhraseMatcher(configured: settings.wakePhrase,
+                                             includeBareName: settings.wakeNameOnly)
 
         // Mirror TTS state into the mute flag the realtime tap consults, and start a short
         // cooldown when speech ends so IRIS's own audio tail can't trigger a wake.
@@ -152,6 +156,35 @@ final class WakeWordDetector {
         beginFreshCapture()
     }
 
+    // MARK: - Push-to-talk (hold the hotkey; no wake phrase, no settle timeout)
+
+    private var pttActive = false
+    private var pttTranscript = ""
+
+    /// PTT key down: restart recognition so the session transcript contains ONLY what's said
+    /// while the key is held; transcripts bypass wake matching and accumulate directly.
+    func beginPushToTalk() {
+        guard isRunning, !capturing else { return }
+        pttActive = true
+        pttTranscript = ""
+        appState?.status = .listening
+        startSession()   // fresh transcript baseline
+    }
+
+    /// PTT key up: deliver whatever was heard, immediately (no settle wait).
+    func endPushToTalk() {
+        guard pttActive else { return }
+        pttActive = false
+        let heard = pttTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        pttTranscript = ""
+        if heard.isEmpty {
+            appState?.status = .idle
+            return
+        }
+        // Strip a wake phrase if they said it anyway, then deliver like any command.
+        deliver(wakeMatcher.commandRemainder(from: heard))
+    }
+
     // MARK: - Recognition session
 
     private func startSession() {
@@ -177,6 +210,10 @@ final class WakeWordDetector {
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }
+        // Bias the recognizer toward the wake vocabulary — "Dory" is otherwise commonly
+        // misheard as "story"/"dori" (docs/algorithms.md → wake word).
+        request.contextualStrings = [Persona.name, "Hey \(Persona.name)", Persona.agentTrigger,
+                                     settings.wakePhrase]
         self.request = request
 
         let gen = generation
@@ -274,10 +311,16 @@ final class WakeWordDetector {
 
     private func handleTranscript(_ transcript: String) {
         guard !capturing else { return }
+        // Push-to-talk bypass: while the key is held, accumulate everything verbatim —
+        // no wake phrase needed. Delivery happens on key-up (endPushToTalk).
+        if pttActive {
+            pttTranscript = transcript
+            return
+        }
         // Ignore the brief window right after IRIS stops talking (its audio tail can linger).
         guard Date() >= speechCooldownUntil else { return }
         NSLog("[IRIS] heard: \"\(transcript)\"")
-        guard transcript.lowercased().contains(settings.wakePhrase) else { return }
+        guard wakeMatcher.matches(transcript) else { return }
         NSLog("[IRIS] wake phrase matched → arming command capture")
 
         // The wake phrase is the ONLY thing that interrupts IRIS mid-speech, so its own TTS or
@@ -307,11 +350,15 @@ final class WakeWordDetector {
         guard awaitingSettle, !capturing else { return }
         awaitingSettle = false
 
-        let remainder = commandRemainder(from: latestWakeTranscript)
-        if !remainder.isEmpty {
-            deliver(remainder)             // command spoken in the same breath as the wake word
+        // With bare-name waking the command may PRECEDE the name ("can you check that, Dory?"),
+        // so fall back to the text before the match before resorting to a fresh capture.
+        let parts = wakeMatcher.commandParts(from: latestWakeTranscript)
+        if !parts.after.isEmpty {
+            deliver(parts.after)           // command spoken in the same breath as the wake word
+        } else if !parts.before.isEmpty {
+            deliver(parts.before)          // "…, Dory?" — the command came first
         } else {
-            beginFreshCapture()            // "hey iris" then a pause → capture the command next
+            beginFreshCapture()            // "hey dory" then a pause → capture the command next
         }
     }
 
@@ -334,7 +381,7 @@ final class WakeWordDetector {
 
     private func deliver(_ command: String) {
         capturing = false
-        // Rapid consecutive commands arrive as ONE transcript ("...screen hey iris what time
+        // Rapid consecutive commands arrive as ONE transcript ("...screen hey dory what time
         // is it"), and only the first wake phrase was stripped upstream. Split on any remaining
         // wake phrases so each command is emitted (and handled concurrently) separately.
         let commands = splitOnWakePhrase(command)
@@ -343,7 +390,7 @@ final class WakeWordDetector {
         } else {
             for c in commands { onWakeWordDetected?(c) }
         }
-        // Keep listening so a second "hey iris" can interrupt while IRIS thinks/speaks
+        // Keep listening so a second "hey dory" can interrupt while IRIS thinks/speaks
         // (barge-in). Start a FRESH recognition session — new transcript, engine/tap stay
         // up — rather than fully stopping. `startSession()` resets the wake bookkeeping.
         // (With barge-in enabled the tap also stays live during `.speaking`, and IRIS's own
@@ -354,29 +401,15 @@ final class WakeWordDetector {
     // MARK: - Command extraction
 
     /// Split a command string on any (additional) occurrences of the wake phrase, returning the
-    /// non-empty segments in order. "what's on my screen hey iris what time is it" →
+    /// non-empty segments in order. "what's on my screen hey dory what time is it" →
     /// ["what's on my screen", "what time is it"]. A string with no wake phrase yields itself.
     private func splitOnWakePhrase(_ command: String) -> [String] {
-        let phrase = settings.wakePhrase
-        var segments: [String] = []
-        var remaining = Substring(command)
-        while let r = remaining.range(of: phrase, options: [.caseInsensitive]) {
-            let before = remaining[..<r.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-            if !before.isEmpty { segments.append(before) }
-            remaining = remaining[r.upperBound...]
-        }
-        let tail = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty { segments.append(tail) }
-        return segments
+        wakeMatcher.splitOnWakePhrase(command)
     }
 
     /// Everything after the wake phrase, trimmed. If the phrase isn't present, the whole
     /// (trimmed) string is returned — used defensively on freshly captured commands too.
     private func commandRemainder(from transcript: String) -> String {
-        if let range = transcript.range(of: settings.wakePhrase, options: [.caseInsensitive]) {
-            return String(transcript[range.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        wakeMatcher.commandRemainder(from: transcript)
     }
 }

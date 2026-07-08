@@ -19,6 +19,9 @@ final class StatusBarItem: NSObject {
     /// Invoked when the user picks "Settings…".
     var onSettings: (() -> Void)?
 
+    /// Invoked when the user picks "Setup & Permissions…".
+    var onSetup: (() -> Void)?
+
     /// Invoked when the user picks "Interrupt IRIS" (stop thinking/speaking now).
     var onInterrupt: (() -> Void)?
 
@@ -37,7 +40,7 @@ final class StatusBarItem: NSObject {
 
         if let button = statusItem.button {
             button.title = "👁"
-            button.toolTip = "IRIS"
+            button.toolTip = Persona.name
         }
 
         statusItem.menu = menu
@@ -52,8 +55,8 @@ final class StatusBarItem: NSObject {
     private func rebuild(tasks: [AgentTask]) {
         menu.removeAllItems()
 
-        addItem("Toggle IRIS", #selector(handleToggle))
-        addItem("Interrupt IRIS", #selector(handleInterrupt), key: ".")
+        addItem("Toggle \(Persona.name)", #selector(handleToggle))
+        addItem("Interrupt \(Persona.name)", #selector(handleInterrupt), key: ".")
 
         // Active background agents, each cancellable.
         let active = tasks.filter { !$0.state.isFinished }
@@ -76,8 +79,9 @@ final class StatusBarItem: NSObject {
 
         menu.addItem(.separator())
         addItem("Settings…", #selector(handleSettings), key: ",")
+        addItem("Setup & Permissions…", #selector(handleSetup))
         menu.addItem(.separator())
-        addItem("Quit IRIS", #selector(handleQuit), key: "q")
+        addItem("Quit \(Persona.name)", #selector(handleQuit), key: "q")
     }
 
     private func addItem(_ title: String, _ action: Selector, key: String = "") {
@@ -89,6 +93,7 @@ final class StatusBarItem: NSObject {
     @objc private func handleToggle() { onToggle?() }
     @objc private func handleInterrupt() { onInterrupt?() }
     @objc private func handleSettings() { onSettings?() }
+    @objc private func handleSetup() { onSetup?() }
 
     @objc private func handleCancelAgent(_ sender: NSMenuItem) {
         if let id = sender.representedObject as? String { onCancelAgent?(id) }

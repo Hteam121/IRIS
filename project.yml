@@ -39,9 +39,17 @@ targets:
     platform: macOS
     sources:
       - path: IRIS
+        excludes:
+          - "Resources/**"
+      # Bundled example skills, copied as a folder reference → Contents/Resources/Skills/.
+      - path: IRIS/Resources/Skills
+        type: folder
+        buildPhase: resources
     settings:
       base:
-        PRODUCT_NAME: IRIS
+        # User-facing product name is Dory; the target, bundle id, and signing stay IRIS
+        # so schemes, TCC grants, and ~/.iris config carry over unchanged.
+        PRODUCT_NAME: Dory
         PRODUCT_BUNDLE_IDENTIFIER: com.iris.app
         INFOPLIST_FILE: IRIS/Info.plist
         CODE_SIGN_ENTITLEMENTS: IRIS/IRIS.entitlements

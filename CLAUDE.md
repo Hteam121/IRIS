@@ -5,9 +5,17 @@ Guidance for Claude Code when working in this repo. Read this first; load `docs/
 ## Project
 
 IRIS (Intelligent Realtime Intelligence System) — a native Swift/macOS floating voice
-assistant. Transparent always-on-top panel near the cursor, "Hey IRIS" wake word, screen
-vision, AI routed through `claude -p` (subscription) with an Anthropic API fallback, TTS
-replies. Menu-bar app, no dock icon. macOS 13+, Swift 5 language mode, built with `xcodegen`.
+assistant, **user-facing name: Dory** ("Hey Dory" wake word, product `Dory.app`).
+Internal identifiers deliberately keep the IRIS names: bundle id `com.iris.app`, `~/.iris/`
+config dir, `IRIS_*` env vars, Swift type names, target/scheme `IRIS` — so TCC grants and
+user data persist. Identity strings (name, triggers, system prompts) live in
+`IRIS/Core/Persona.swift`; do not hardcode "Dory"/"IRIS" in user-facing strings elsewhere.
+
+Transparent always-on-top panel near the cursor, wake word, screen vision, on-screen
+pointing (PointerOverlay/ScreenPointer), markdown skills (`~/.iris/skills/`), local-first
+answering (Ollama/Apple FM → cloud), AI routed through `claude -p` (subscription) with an
+Anthropic API fallback, TTS replies. Menu-bar app, no dock icon. macOS 13+, Swift 5
+language mode, built with `xcodegen`.
 
 The authoritative build plan is `plan.md` (3-agent Kanban). Follow it.
 
@@ -67,11 +75,20 @@ Keep entries concise and factual. One entry per completed task/step, newest appe
 6. **ScreenCaptureKit:** `SCScreenshotManager.captureImage` (macOS 14+); build `NSImage` with the
    real pixel size and export **PNG** (not `.zero` / TIFF).
 
-## AI Routing (Hybrid — confirmed)
+## AI Routing (post-reconstruction, 2026-07)
 
-- If `ANTHROPIC_API_KEY` is set → Anthropic Messages API with real base64 vision.
-- Else → `claude -p` via stdin, screenshot passed as a temp PNG path.
-- Transcripts containing "iris agent" route to `AgentMode` (spawns `claude` for agentic tasks).
+- `Router.swift` routes every command deterministically (zero LLM classifiers); unmatched
+  commands fall through to `.answer`.
+- `.answer` → `ClaudeEngine.swift`: local model first (Ollama/Apple FM), then streaming cloud —
+  Anthropic Messages API (SSE, prompt caching, base64 vision, server-side web search on
+  current-events cues) when `ANTHROPIC_API_KEY` is set, else `claude -p --output-format
+  stream-json` via stdin (screenshot as temp PNG path + `--allowedTools Read`).
+- Action commands ("create a file…") and "dory agent"/legacy "iris agent" transcripts →
+  `ClaudeSessionManager.swift`: background `claude -p` stream-json sessions with live pill
+  progress, narrated milestones, `--resume` continuity (`~/.iris/sessions.json`), and
+  `--mcp-config ~/.iris/mcp.json` for calendar/MCP tools.
+- `CompanionManager.swift` owns the whole pipeline (AppDelegate is a thin bootstrap);
+  triggers are the wake word (bare-name allowed) and hold-⌥Space push-to-talk.
 
 ## Permissions
 

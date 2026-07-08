@@ -3,13 +3,13 @@
 //  IRIS — Core (cost control)
 //
 //  Meters real OpenAI spend and adapts IRIS's behavior to stay within a user-set monthly
-//  budget. Realtime cost is computed EXACTLY from the token `usage` the Realtime API returns
-//  on each `response.done`; TTS cost is estimated from characters synthesized. Spend is
-//  persisted to ~/.iris/usage.json and rolls over each calendar month.
+//  budget. TTS cost is estimated from characters synthesized; one-shot vision/classifier
+//  calls are metered from their returned `usage`. Spend is persisted to ~/.iris/usage.json
+//  and rolls over each calendar month.
 //
 //  The governor exposes a `tier()` the rest of the app checks at each interaction:
-//    • .premium → realtime (gpt-realtime-mini) conversation mode allowed — best experience.
-//    • .saver   → classic `claude -p` pipeline (free brain) default; realtime suppressed.
+//    • .premium → paid conveniences (neural TTS, paid vision) allowed — best experience.
+//    • .saver   → today's fair share of the budget is spent; prefer the free pipeline.
 //    • .free    → budget exhausted: `claude -p` brain + on-device TTS only (zero OpenAI spend).
 //
 //  Pacing (docs/algorithms.md → Cost Governor): besides the spent-fraction tiers, a daily
@@ -21,41 +21,31 @@ import Foundation
 
 /// How constrained IRIS should be given the remaining monthly budget.
 public enum CostTier: String, Sendable {
-    case premium   // realtime conversation mode allowed
-    case saver     // classic claude -p pipeline default; realtime suppressed
+    case premium   // paid conveniences (neural TTS, paid vision) allowed
+    case saver     // today's fair share spent; prefer the free pipeline
     case free      // budget spent: claude -p brain + on-device TTS only
 }
 
 @MainActor
 public final class CostGovernor {
 
-    /// OpenAI rates in USD per 1,000,000 tokens. See docs/algorithms.md → Cost Governor.
-    struct RealtimeRates {
-        let audioIn: Double, audioInCached: Double, audioOut: Double
-        let textIn: Double, textInCached: Double, textOut: Double
-    }
-    /// gpt-realtime-mini (gpt-4o-mini-realtime): the cost-optimized default.
-    static let miniRates = RealtimeRates(
-        audioIn: 10, audioInCached: 0.30, audioOut: 20, textIn: 0.60, textInCached: 0.30, textOut: 2.40)
-    /// gpt-realtime (full GA model): ~3.2× the mini audio rates.
-    static let fullRates = RealtimeRates(
-        audioIn: 32, audioInCached: 0.40, audioOut: 64, textIn: 4, textInCached: 0.40, textOut: 16)
     /// gpt-4o-mini-tts ≈ $15 per 1M input characters (token-based; this is the documented estimate).
     static let ttsCostPerChar = 15.0 / 1_000_000.0
-    /// gpt-4o (vision + function-calling) text rates, USD per 1,000,000 tokens. Used to meter the
-    /// one-shot paid calls — screen-rule vision match, screen vision, OpenAI command classifier.
-    static let visionInputRate = 2.50
-    static let visionOutputRate = 10.0
-    /// Fallback per-call estimate (~one screenshot vision call) when a response omits `usage`, so a
-    /// paid call is never recorded as zero spend.
-    static let visionFlatEstimateUSD = 0.005
+
+    /// Anthropic per-model rates, USD per 1,000,000 tokens (input, output). Cache reads bill at
+    /// 0.1× input; cache writes at 1.25× input. Matched by model-id substring.
+    private static func anthropicRates(for model: String) -> (input: Double, output: Double) {
+        let m = model.lowercased()
+        if m.contains("haiku") { return (1, 5) }
+        if m.contains("opus") { return (15, 75) }
+        return (3, 15)   // sonnet-class default
+    }
 
     // Tier thresholds (docs/algorithms.md → Cost Governor).
     private static let saverFraction = 0.75    // ≥75% of budget spent → saver
     private static let freeFloorUSD = 0.01     // ≤1¢ remaining → free
 
     private(set) var budgetUSD: Double         // 0 (or negative) ⇒ unlimited
-    private var realtimeModelIsMini: Bool
 
     // Persisted spend state (~/.iris/usage.json).
     private var month: String                  // "yyyy-MM"
@@ -65,9 +55,8 @@ public final class CostGovernor {
 
     private let fileURL: URL
 
-    public init(budgetUSD: Double, realtimeModel: String) {
+    public init(budgetUSD: Double) {
         self.budgetUSD = budgetUSD
-        self.realtimeModelIsMini = realtimeModel.lowercased().contains("mini")
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".iris", isDirectory: true)
         self.fileURL = dir.appendingPathComponent("usage.json")
@@ -81,43 +70,8 @@ public final class CostGovernor {
     // MARK: - Live config
 
     public func applyBudget(_ usd: Double) { budgetUSD = max(0, usd) }
-    public func applyRealtimeModel(_ model: String) {
-        realtimeModelIsMini = model.lowercased().contains("mini")
-    }
 
     // MARK: - Metering
-
-    /// Record one realtime turn's spend from the `usage` object in a `response.done` event.
-    public func recordRealtime(usage: [String: Any]) {
-        let rates = realtimeModelIsMini ? Self.miniRates : Self.fullRates
-        let inDet = usage["input_token_details"] as? [String: Any] ?? [:]
-        let outDet = usage["output_token_details"] as? [String: Any] ?? [:]
-
-        let totalAudioIn = intOf(inDet["audio_tokens"])
-        let totalTextIn = intOf(inDet["text_tokens"])
-
-        var cachedAudioIn = 0, cachedTextIn = 0
-        if let cached = inDet["cached_tokens_details"] as? [String: Any] {
-            cachedAudioIn = intOf(cached["audio_tokens"])
-            cachedTextIn = intOf(cached["text_tokens"])
-        } else {
-            // Older shape: a flat `cached_tokens`. Attribute to audio (the dominant input).
-            cachedAudioIn = min(totalAudioIn, intOf(inDet["cached_tokens"]))
-        }
-
-        let uncachedAudioIn = max(0, totalAudioIn - cachedAudioIn)
-        let uncachedTextIn = max(0, totalTextIn - cachedTextIn)
-        let audioOut = intOf(outDet["audio_tokens"])
-        let textOut = intOf(outDet["text_tokens"])
-
-        let cost = (Double(uncachedAudioIn) * rates.audioIn
-            + Double(cachedAudioIn) * rates.audioInCached
-            + Double(uncachedTextIn) * rates.textIn
-            + Double(cachedTextIn) * rates.textInCached
-            + Double(audioOut) * rates.audioOut
-            + Double(textOut) * rates.textOut) / 1_000_000.0
-        add(cost)
-    }
 
     /// Record a neural-TTS synthesis (estimated from character count).
     public func recordTTS(characters: Int) {
@@ -125,15 +79,16 @@ public final class CostGovernor {
         add(Double(characters) * Self.ttsCostPerChar)
     }
 
-    /// Record one paid gpt-4o call (screen-rule match, screen vision, or OpenAI command
-    /// classifier) from the `usage` object the chat-completions API returns. Falls back to a small
-    /// flat estimate when `usage` is absent so the spend is never silently dropped.
-    public func recordVision(usage: [String: Any]?) {
-        let inTok = intOf(usage?["prompt_tokens"])
-        let outTok = intOf(usage?["completion_tokens"])
-        let cost = (inTok > 0 || outTok > 0)
-            ? (Double(inTok) * Self.visionInputRate + Double(outTok) * Self.visionOutputRate) / 1_000_000.0
-            : Self.visionFlatEstimateUSD
+    /// Record one Anthropic Messages API call from its returned token usage (streamed calls may
+    /// report input and output in separate events — both land here additively).
+    public func recordAnthropic(model: String, inputTokens: Int, cacheReadTokens: Int,
+                                cacheWriteTokens: Int, outputTokens: Int) {
+        let rates = Self.anthropicRates(for: model)
+        // `input_tokens` excludes cached tokens; cache reads are 0.1× and writes 1.25× input rate.
+        let cost = (Double(inputTokens) * rates.input
+            + Double(cacheReadTokens) * rates.input * 0.1
+            + Double(cacheWriteTokens) * rates.input * 1.25
+            + Double(outputTokens) * rates.output) / 1_000_000.0
         add(cost)
     }
 
@@ -159,8 +114,6 @@ public final class CostGovernor {
         return .premium
     }
 
-    /// Whether the paid realtime conversation core may run right now.
-    public var allowsRealtime: Bool { tier() == .premium }
     /// Whether neural (OpenAI) TTS may be used right now (else on-device).
     public var allowsNeuralTTS: Bool { tier() != .free }
     /// Whether a paid one-shot OpenAI call (screen-rule vision match, screen vision, OpenAI command

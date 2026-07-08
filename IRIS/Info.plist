@@ -13,7 +13,7 @@
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundleDisplayName</key>
-	<string>IRIS</string>
+	<string>Dory</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -29,13 +29,13 @@
 	<true/>
 	<!-- TCC usage strings (Microphone, Speech Recognition, Screen Recording). -->
 	<key>NSMicrophoneUsageDescription</key>
-	<string>IRIS listens for the "Hey IRIS" wake word and your spoken commands.</string>
+	<string>Dory listens for the "Hey Dory" wake word and your spoken commands.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>IRIS transcribes your speech to understand commands.</string>
+	<string>Dory transcribes your speech to understand commands.</string>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>IRIS captures your screen so it can answer questions about what you're looking at.</string>
-	<!-- Automation: IRIS opens Terminal to start Claude Code sessions you ask for. -->
+	<string>Dory captures your screen so it can answer questions about what you're looking at.</string>
+	<!-- Automation: Dory opens Terminal to start Claude Code sessions you ask for. -->
 	<key>NSAppleEventsUsageDescription</key>
-	<string>IRIS opens Terminal to start coding sessions you ask for.</string>
+	<string>Dory opens Terminal to start coding sessions you ask for.</string>
 </dict>
 </plist>
